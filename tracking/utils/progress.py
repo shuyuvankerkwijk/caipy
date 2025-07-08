@@ -18,12 +18,6 @@ class ProgressInfo:
     """Progress information for tracking operations."""
     operation_type: OperationType
     antenna: str
-    current_step: int
-    total_steps: int
-    current_az: Optional[float] = None
-    current_el: Optional[float] = None
-    target_az: Optional[float] = None
-    target_el: Optional[float] = None
     percent_complete: float = 0.0
     message: str = ""
     is_complete: bool = False

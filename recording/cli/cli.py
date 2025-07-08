@@ -28,9 +28,10 @@ def main():
         epilog="""
 Examples:
   %(prog)s --duration 60                    # Record for 60 seconds
-  %(prog)s --name "test_observation"        # Record with custom name
-  %(prog)s --fftshift 1000 --acclen 65536  # Set FPGA parameters and record
+  %(prog)s --name "test_observation"        # Record continuously with custom name
+  %(prog)s --fftshift 1000 --acclen 65536  # Set FPGA parameters and record continuously
   %(prog)s --status                         # Show device status only
+  %(prog)s                                  # Start continuous recording (default behavior)
         """
     )
     
@@ -43,7 +44,7 @@ Examples:
     parser.add_argument(
         '--duration', '-d',
         type=int,
-        help='Recording duration in seconds (default: run until interrupted)'
+        help='Recording duration in seconds (if not specified, records continuously until interrupted)'
     )
     parser.add_argument(
         '--waittime', '-w',
@@ -125,7 +126,7 @@ Examples:
         if args.duration:
             logger.info(f"Starting recording for {args.duration} seconds...")
         else:
-            logger.info("Starting recording (press Ctrl+C to stop)...")
+            logger.info("Starting continuous recording (will create new files every 2000 lines, press Ctrl+C to stop)...")
         
         success = recorder.start_recording(
             observation_name=args.name,

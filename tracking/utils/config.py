@@ -67,6 +67,9 @@ class TelescopeConfig:
     n_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
     s_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
 
+    sto: float = 1.173   # seconds
+    delay: float = 3.0   # seconds
+
     def __post_init__(self):
         if self.location is None:
             self.location = EarthLocation(lat=self.latitude * u.deg, 

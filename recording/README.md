@@ -25,7 +25,11 @@ pip install -e .
 ```python
 from recording import Recorder, logger
 
-# Basic usage with context manager
+# Basic usage with context manager (continuous recording)
+with Recorder() as recorder:
+    recorder.start_recording(observation_name="continuous_run")  # Records until stopped
+
+# Timed recording
 with Recorder() as recorder:
     recorder.start_recording(observation_name="test_run", duration_seconds=60)
 
@@ -34,7 +38,7 @@ recorder = Recorder()
 recorder.set_fftshift(1000)
 recorder.set_acclen(65536)
 recorder.set_waittime(0.1)
-recorder.start_recording(observation_name="calibration")
+recorder.start_recording(observation_name="calibration")  # Continuous recording
 ```
 
 ### Command Line Interface
@@ -43,11 +47,14 @@ recorder.start_recording(observation_name="calibration")
 # Record for 60 seconds
 recording --duration 60
 
-# Record with custom name
-recording --name "test_observation"
+# Continuous recording (default behavior - creates new files every 2000 lines)
+recording --name "continuous_observation"
 
-# Set FPGA parameters and record
-recording --fftshift 1000 --acclen 65536 --duration 120
+# Record with custom name
+recording --name "test_observation" --duration 120
+
+# Set FPGA parameters and record continuously
+recording --fftshift 1000 --acclen 65536
 
 # Show device status
 recording --status

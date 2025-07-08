@@ -7,7 +7,6 @@ import time
 import logging
 import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
-from tracking.utils.helpers import d2m
 from tracking.utils.config import config
 from tracking.utils.colors import Colors
 
@@ -396,7 +395,7 @@ class MqttController:
         }
         self.send_mqtt_command(self.topic_prg_trk_cmd, sv)
 
-    def send_track_start_time(self, sst):
+    def send_track_start_time(self, time):
         """
         Send the start time to the program track.
         """
@@ -405,7 +404,7 @@ class MqttController:
             'source': config.mqtt.source,
             'destination': config.mqtt.destination_prg_trk,
             'name': 'set_start_time',
-            'args': [d2m(sst)]
+            'args': [time]
         }
         self.send_mqtt_command(self.topic_prg_trk_cmd, sv)
 
