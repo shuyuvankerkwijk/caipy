@@ -142,29 +142,3 @@ class TrackingConfig:
 
 # Global configuration instance
 config = TrackingConfig()
-
-
-def load_config(config_file: Optional[Path] = None) -> TrackingConfig:
-    """
-    Load configuration from file.
-    
-    Args:
-        config_file: Path to configuration file (JSON or YAML)
-        
-    Returns:
-        Loaded configuration
-    """
-    #TODO
-    return config
-
-
-def save_config(config: TrackingConfig, config_file: Path) -> None:
-    """
-    Save configuration to file.
-    
-    Args:
-        config: Configuration to save
-        config_file: Path to save configuration to
-    """
-    # TODO
-    pass 

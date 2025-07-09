@@ -39,13 +39,14 @@ class Tracker:
         run_track(): Complete tracking operation with optional slewing and parking
         run_slew(): Slew to a target position
         run_park(): Park the telescope
+        stop(): Stop current operation
+        get_current_position(): Get current telescope position
+        cleanup(): Clean up resources and disconnect
     """
     
     def __init__(self) -> None:
         """
-        Initialize the StarTracker with default parameters.
-        
-        Sets up sky offsets and elevation limits.
+        Initialize the Tracker with default parameters.
         """
         self.safety_checker = SafetyChecker()
         self.pointing = AstroPointing()
@@ -57,18 +58,10 @@ class Tracker:
         
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
-    
-    def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
-        def signal_handler(signum: int, frame: Any) -> None:
-            logger.warning(f"{Colors.RED}Received signal {signum}, initiating graceful shutdown{Colors.RESET}")
-            self.stop()
-            
-            if signum == signal.SIGINT:
-                raise KeyboardInterrupt("Telescope operation interrupted")
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+
+    # ============================================================================
+    # PUBLIC API METHODS
+    # ============================================================================
 
     def run_track(self, ant: str, source: Source, duration_hours: float, 
                   slew: bool = True, park: bool = True, 
@@ -100,23 +93,13 @@ class Tracker:
         logger.info(f"Duration: {duration_hours:.4f} hours")
 
         try:
-            # Setup
             if not self._setup(ant, source):
                 raise OperationError("Failed to setup tracker")
 
-            # Validate target coordinates using safety checker
-            logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
-            validation_result = self.safety_checker.validate_target(pointing=self.pointing, source=source, ant=ant)
-            if not validation_result.is_safe:
-                raise SafetyError(f"Target validation failed: {validation_result.message}")
+            # Validate target coordinates
+            self._validate_target(source, ant, duration_hours)
 
-            # Check run safety
-            logger.info(f"{Colors.BLUE}Performing sun safety check...{Colors.RESET}")
-            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, duration_hours)
-            if not safety_result.is_safe:
-                raise SafetyError(f"Sun safety check failed: {safety_result.message}")
-
-            # If requested, safely slew to target
+            # Slew to target if requested
             if slew:
                 logger.info(f"{Colors.BLUE}Slewing to target...{Colors.RESET}")
                 if not self._slew(progress_callback=progress_callback):
@@ -136,7 +119,7 @@ class Tracker:
             if not self._track(duration_hours, progress_callback=progress_callback):
                 raise OperationError("Tracking failed")
 
-            # If requested, safely park
+            # Park if requested
             if park:
                 logger.info(f"{Colors.BLUE}Parking telescope...{Colors.RESET}")
                 if not self._park(progress_callback=progress_callback):
@@ -182,27 +165,18 @@ class Tracker:
         logger.info(f"{Colors.BLUE}Starting slew operation for antenna {ant}{Colors.RESET}")
         
         try:
-            # Setup
             if not self._setup(ant, source):
                 raise OperationError("Failed to setup tracker")
 
-            # Validate target coordinates and slew
+            # Validate and slew to target
             if source is not None:
-                logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
-                validation_result = self.safety_checker.validate_target(pointing=self.pointing, source=source, ant=ant)
-                if not validation_result.is_safe:
-                    raise SafetyError(f"Target validation failed: {validation_result.message}")
-
+                self._validate_target(source, ant)
                 logger.info(f"Target coordinates: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
                 if not self._slew(progress_callback=progress_callback):
                     raise OperationError("Slewing failed")
 
             elif az is not None and el is not None:
-                logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
-                validation_result = self.safety_checker.validate_target(az=az, el=el, ant=ant)
-                if not validation_result.is_safe:
-                    raise SafetyError(f"Target validation failed: {validation_result.message}")
-                
+                self._validate_target_coordinates(az, el, ant)
                 logger.info(f"Target coordinates: AZ={az:.2f}°, EL={el:.2f}°")
                 if not self._slew(az=az, el=el, progress_callback=progress_callback):
                     raise OperationError("Slewing failed")
@@ -244,7 +218,6 @@ class Tracker:
         logger.info(f"{Colors.BLUE}Starting park operation for antenna {ant}{Colors.RESET}")
         
         try:
-            # Setup
             if not self._setup(ant):
                 raise OperationError("Failed to setup tracker")
 
@@ -263,6 +236,98 @@ class Tracker:
             raise OperationError(error_msg)
         finally:
             self._cleanup(auto_cleanup)
+
+    def stop(self) -> bool:
+        """
+        Interrupts all ongoing operations and stops motion for the specified antenna(s) or all if None.
+        """
+        try:
+            self.state = State.STOP
+            if hasattr(self, 'mqtt') and self.mqtt is not None:
+                self.mqtt.set_axis_mode_stop()
+                current_pos = self.mqtt.get_current_position()
+                if current_pos[0] is not None and current_pos[1] is not None:
+                    logger.info(f"{Colors.RED}Antenna {self.ant} stopped at: ({current_pos[0]:.2f}, {current_pos[1]:.2f}){Colors.RESET}")
+                else:
+                    logger.info(f"{Colors.RED}Antenna {self.ant} stopped (position unknown){Colors.RESET}")
+            else:
+                logger.warning(f"{Colors.RED}MQTT not available for stop command{Colors.RESET}")
+        except Exception as e:
+            logger.error(f"{Colors.RED}Error stopping motion: {e}{Colors.RESET}")
+            return False
+        return True
+
+    def get_current_position(self) -> tuple:
+        """
+        Get the current telescope position.
+        
+        Returns:
+            tuple: (azimuth, elevation) in degrees, or (None, None) if not available
+        """
+        try:
+            if hasattr(self, 'mqtt') and self.mqtt is not None:
+                return self.mqtt.get_current_position()
+            else:
+                return (None, None)
+        except Exception as e:
+            logger.warning(f"Error getting current position: {e}")
+            return (None, None)
+    
+    def cleanup(self) -> None:
+        """
+        Clean up resources and safely disconnect from MQTT.
+        
+        Sends stop commands to both axes and properly disconnects the MQTT client.
+        Should be called when tracking is complete or interrupted.
+        """
+        logger.info(f"{Colors.BLUE}Cleaning up resources...{Colors.RESET}")
+        
+        # Stop motion if MQTT is available
+        if hasattr(self, 'mqtt') and self.mqtt is not None:
+            try:
+                self.stop()
+            except Exception as e:
+                logger.warning(f"{Colors.RED}Error stopping motion: {e}{Colors.RESET}")
+            
+            # Disconnect MQTT if client exists
+            if hasattr(self.mqtt, 'mqtt_client') and self.mqtt.mqtt_client is not None:
+                try:
+                    self.mqtt.mqtt_client.loop_stop()
+                    self.mqtt.mqtt_client.disconnect()
+                    logger.info(f"{Colors.BLUE}MQTT disconnected{Colors.RESET}")
+                except Exception as e:
+                    logger.warning(f"{Colors.RED}Error disconnecting MQTT: {e}{Colors.RESET}")
+            else:
+                logger.warning(f"{Colors.RED}MQTT client not initialized{Colors.RESET}")
+        else:
+            logger.warning(f"{Colors.RED}MQTT controller not initialized{Colors.RESET}")
+
+        # Reset state
+        if hasattr(self, 'target') and self.target is not None:
+            self.target = None
+        if hasattr(self, 'ant') and self.ant is not None:
+            self.ant = None
+        if hasattr(self, 'state') and self.state is not None:
+            self.state = State.IDLE
+        self._is_initialized = False
+
+        logger.info(f"{Colors.GREEN}Cleanup complete{Colors.RESET}")
+
+    # ============================================================================
+    # PRIVATE HELPER METHODS
+    # ============================================================================
+
+    def _setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful shutdown."""
+        def signal_handler(signum: int, frame: Any) -> None:
+            logger.warning(f"{Colors.RED}Received signal {signum}, initiating graceful shutdown{Colors.RESET}")
+            self.stop()
+            
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt("Telescope operation interrupted")
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
     def _setup(self, ant: str, source: Optional[Source] = None) -> bool:
         """
@@ -306,6 +371,26 @@ class Tracker:
             if isinstance(e, (ValidationError, MQTTError)):
                 raise
             raise MQTTError(f"Setup failed: {e}")
+
+    def _validate_target(self, source: Source, ant: str, duration_hours: Optional[float] = None) -> None:
+        """Validate target coordinates and safety."""
+        logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
+        validation_result = self.safety_checker.validate_target(pointing=self.pointing, source=source, ant=ant)
+        if not validation_result.is_safe:
+            raise SafetyError(f"Target validation failed: {validation_result.message}")
+
+        if duration_hours is not None:
+            logger.info(f"{Colors.BLUE}Performing sun safety check...{Colors.RESET}")
+            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, duration_hours)
+            if not safety_result.is_safe:
+                raise SafetyError(f"Sun safety check failed: {safety_result.message}")
+
+    def _validate_target_coordinates(self, az: float, el: float, ant: str) -> None:
+        """Validate target coordinates."""
+        logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
+        validation_result = self.safety_checker.validate_target(az=az, el=el, ant=ant)
+        if not validation_result.is_safe:
+            raise SafetyError(f"Target validation failed: {validation_result.message}")
 
     def _track(self, duration_hours: float, 
                progress_callback: Optional[ProgressCallback] = None) -> bool:
@@ -389,10 +474,10 @@ class Tracker:
                     percent_complete=percent,
                     message=f"Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s"
                 )
-                logger.info(f"{Colors.BLUE}Track progress: Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
                 progress_callback(progress_info)
-            elif (i + 1) % 10 == 0:
-                # Log progress every 10 points (5 seconds)
+            
+            # Log progress every 10 points (5 seconds)
+            if (i + 1) % 10 == 0:
                 logger.info(f"{Colors.BLUE}Track progress: Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
 
         # Log final progress
@@ -523,27 +608,6 @@ class Tracker:
         
         return True
         
-    def stop(self) -> bool:
-        """
-        Interrupts all ongoing operations and stops motion for the specified antenna(s) or all if None.
-        """
-        try:
-            self.state = State.STOP
-            if hasattr(self, 'mqtt') and self.mqtt is not None:
-                self.mqtt.set_axis_mode_stop()
-                current_pos = self.mqtt.get_current_position()
-                if current_pos[0] is not None and current_pos[1] is not None:
-                    logger.info(f"{Colors.RED}Antenna {self.ant} stopped at: ({current_pos[0]:.2f}, {current_pos[1]:.2f}){Colors.RESET}")
-                else:
-                    logger.info(f"{Colors.RED}Antenna {self.ant} stopped (position unknown){Colors.RESET}")
-            else:
-                logger.warning(f"{Colors.RED}MQTT not available for stop command{Colors.RESET}")
-        except Exception as e:
-            logger.error(f"{Colors.RED}Error stopping motion: {e}{Colors.RESET}")
-            return False
-        # self.state = State.IDLE
-        return True
-
     def _get_current_offset(self) -> float:
         """
         Get the difference between the current position and the target position in deg.
@@ -560,62 +624,6 @@ class Tracker:
         offset = angular_separation(az_current, el_current, az_target, el_target)        
         return offset
     
-    def get_current_position(self) -> tuple:
-        """
-        Get the current telescope position.
-        
-        Returns:
-            tuple: (azimuth, elevation) in degrees, or (None, None) if not available
-        """
-        try:
-            if hasattr(self, 'mqtt') and self.mqtt is not None:
-                return self.mqtt.get_current_position()
-            else:
-                return (None, None)
-        except Exception as e:
-            logger.warning(f"Error getting current position: {e}")
-            return (None, None)
-    
-    def cleanup(self) -> None:
-        """
-        Clean up resources and safely disconnect from MQTT.
-        
-        Sends stop commands to both axes and properly disconnects the MQTT client.
-        Should be called when tracking is complete or interrupted.
-        """
-        logger.info(f"{Colors.BLUE}Cleaning up resources...{Colors.RESET}")
-        
-        # Stop motion if MQTT is available
-        if hasattr(self, 'mqtt') and self.mqtt is not None:
-            try:
-                self.stop()
-            except Exception as e:
-                logger.warning(f"{Colors.RED}Error stopping motion: {e}{Colors.RESET}")
-            
-            # Disconnect MQTT if client exists
-            if hasattr(self.mqtt, 'mqtt_client') and self.mqtt.mqtt_client is not None:
-                try:
-                    self.mqtt.mqtt_client.loop_stop()
-                    self.mqtt.mqtt_client.disconnect()
-                    logger.info(f"{Colors.BLUE}MQTT disconnected{Colors.RESET}")
-                except Exception as e:
-                    logger.warning(f"{Colors.RED}Error disconnecting MQTT: {e}{Colors.RESET}")
-            else:
-                logger.warning(f"{Colors.RED}MQTT client not initialized{Colors.RESET}")
-        else:
-            logger.warning(f"{Colors.RED}MQTT controller not initialized{Colors.RESET}")
-
-        # Reset state
-        if hasattr(self, 'target') and self.target is not None:
-            self.target = None
-        if hasattr(self, 'ant') and self.ant is not None:
-            self.ant = None
-        if hasattr(self, 'state') and self.state is not None:
-            self.state = State.IDLE
-        self._is_initialized = False
-
-        logger.info(f"{Colors.GREEN}Cleanup complete{Colors.RESET}")
-
     def _cleanup(self, auto_cleanup: bool) -> None:
         """
         Handles cleanup after a successful or failed operation.

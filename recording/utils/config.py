@@ -47,6 +47,9 @@ class RecordingConfig:
     data_buffer_shape: tuple = (2000, 8195)  # (rows, columns)
     cross_correlations_per_batch: int = 10
     
+    # Buffer settings
+    N: int = 4  # Number of time samples to keep in buffer for plotting
+    
     # File paths
     base_directory: Optional[Path] = None
     
@@ -63,6 +66,9 @@ class RecordingConfig:
         
         if self.cross_correlations_per_batch > self.rows_per_batch:
             raise ConfigurationError("cross_correlations_per_batch cannot be greater than rows_per_batch")
+        
+        if self.N <= 0:
+            raise ConfigurationError("N must be positive")
         
         if self.base_directory is None:
             self.base_directory = Path.home() / "vikram/testarray/data"
@@ -95,29 +101,3 @@ class RecorderConfig:
 
 # Global configuration instance
 config = RecorderConfig()
-
-
-def load_config(config_file: Optional[Path] = None) -> RecorderConfig:
-    """
-    Load configuration from file.
-    
-    Args:
-        config_file: Path to configuration file (JSON or YAML)
-        
-    Returns:
-        Loaded configuration
-    """
-    # TODO: Implement configuration file loading
-    return config
-
-
-def save_config(config: RecorderConfig, config_file: Path) -> None:
-    """
-    Save configuration to file.
-    
-    Args:
-        config: Configuration to save
-        config_file: Path to save configuration to
-    """
-    # TODO: Implement configuration file saving
-    pass 
