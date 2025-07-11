@@ -36,8 +36,9 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QTextEdit,
     QProgressBar,
+    QCheckBox,
 )
-from PyQt5.QtCore import QObject, pyqtSignal, Qt
+from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import numpy as np
@@ -46,6 +47,8 @@ from tracking import Tracker, Source
 from tracking.utils.progress import ProgressCallback as TrkProgCB, ProgressInfo as TrkProgInfo
 from recording import Recorder
 from recording.utils.progress import ProgressCallback as RecProgCB, ProgressInfo as RecProgInfo, OperationType as RecOpType
+from tracking.utils.coordinate_utils import get_targets_offsets, radec_to_azel, get_ovro_location_info
+from utils.ftx import FTXController, Antenna, Polarization
 
 # -----------------------------------------------------------------------------
 # Helper – safe constructor for Tracker in worker threads (handles signal.signal)
@@ -118,16 +121,27 @@ class AntennaPositionBridge(QObject):
             # Qt object has been deleted, ignore the signal emission
             pass
 
+class TrackerCompletionBridge(QObject):
+    completion_signal = pyqtSignal(str)  # (antenna)
+
+    def emit_completion(self, antenna: str):
+        try:
+            self.completion_signal.emit(antenna)
+        except RuntimeError:
+            # Qt object has been deleted, ignore the signal emission
+            pass
+
 # -----------------------------------------------------------------------------
 # Worker threads
 # -----------------------------------------------------------------------------
 
 class TrackerThread(threading.Thread):
-    def __init__(self, ant: str, prog_cb: UIProgressBridge, logger_: logging.Logger):
+    def __init__(self, ant: str, prog_cb: UIProgressBridge, completion_cb: TrackerCompletionBridge, logger_: logging.Logger):
         super().__init__(daemon=True)
         self.ant = ant
         self.log = logger_.getChild(f"tracker_{ant}")
         self.prog_cb = prog_cb
+        self.completion_cb = completion_cb
         self.cmd_q: queue.Queue[Tuple[str, Dict]] = queue.Queue()
         self.running = True
         self.tracker: Tracker | None = None
@@ -196,10 +210,80 @@ class TrackerThread(threading.Thread):
             try:
                 if cmd == "slew":
                     self.tracker.run_slew(ant=self.ant, progress_callback=self._progress_callback_with_stop_check, auto_cleanup=False, **kw)
+                    self.completion_cb.emit_completion(self.ant)
                 elif cmd == "track":
                     self.tracker.run_track(ant=self.ant, progress_callback=self._progress_callback_with_stop_check, auto_cleanup=False, **kw)
+                    self.completion_cb.emit_completion(self.ant)
                 elif cmd == "park":
                     self.tracker.run_park(ant=self.ant, progress_callback=self._progress_callback_with_stop_check, auto_cleanup=False)
+                    self.completion_cb.emit_completion(self.ant)
+                elif cmd == "rasta_scan":
+                    # Extract parameters and create source
+                    source = kw.get('source')
+                    max_distance_deg = kw.get('max_dist_deg')
+                    steps_deg = kw.get('step_deg')
+                    position_angle_deg = kw.get('position_angle_deg')
+                    duration_hours = kw.get('duration_hours')
+                    slew = kw.get('slew', True)  # Default to True if not provided
+                    park = kw.get('park', True)   # Default to True if not provided
+                    
+                    # Debug logging to see what parameters are being passed
+                    self.log.info(f"RASTA scan parameters: max_dist_deg={max_distance_deg}, steps_deg={steps_deg}, position_angle_deg={position_angle_deg}, duration_hours={duration_hours}, slew={slew}, park={park}")
+                    self.log.info(f"All kw parameters: {kw}")
+                    
+                    # Check that all required parameters are present
+                    if source is None:
+                        raise ValueError("source parameter is required")
+                    if max_distance_deg is None:
+                        raise ValueError("max_dist_deg parameter is required")
+                    if steps_deg is None:
+                        raise ValueError("step_deg parameter is required")
+                    if position_angle_deg is None:
+                        raise ValueError("position_angle_deg parameter is required")
+                    if duration_hours is None:
+                        raise ValueError("duration_hours parameter is required")
+                    
+                    # Additional debug logging
+                    self.log.info(f"About to call run_rasta_scan with duration_hours={duration_hours}")
+                    
+                    self.tracker.run_rasta_scan(
+                        ant=self.ant, 
+                        source=source, 
+                        max_distance_deg=max_distance_deg, 
+                        steps_deg=steps_deg, 
+                        position_angle_deg=position_angle_deg, 
+                        duration_hours=duration_hours, 
+                        slew=slew,
+                        park=park,
+                        progress_callback=self._progress_callback_with_stop_check, 
+                        auto_cleanup=False
+                    )
+                    self.completion_cb.emit_completion(self.ant)
+                elif cmd == "pointing_offsets":
+                    source = kw.get('source')
+                    closest_dist_deg = kw.get('closest_dist_deg')
+                    number_of_points = kw.get('number_of_points')
+                    duration_hours = kw.get('duration_hours')
+                    slew = kw.get('slew', True)
+                    park = kw.get('park', True)
+
+                    if source is None or closest_dist_deg is None or number_of_points is None or duration_hours is None:
+                        raise ValueError("Missing parameters for pointing_offsets command")
+
+                    self.log.info("POINTING parameters: dist=%s, npts=%s, duration=%s", closest_dist_deg, number_of_points, duration_hours)
+
+                    self.tracker.run_pointing_offsets(
+                        ant=self.ant,
+                        source=source,
+                        closest_distance_deg=closest_dist_deg,
+                        number_of_points=number_of_points,
+                        duration_hours=duration_hours,
+                        slew=slew,
+                        park=park,
+                        progress_callback=self._progress_callback_with_stop_check,
+                        auto_cleanup=False,
+                    )
+                    self.completion_cb.emit_completion(self.ant)
                 elif cmd == "stop":
                     # For immediate stop, use the request mechanism
                     self.request_stop()
@@ -207,8 +291,10 @@ class TrackerThread(threading.Thread):
                     self.log.warning("Unknown cmd %s", cmd)
             except InterruptedError as exc:
                 self.log.info("Operation interrupted: %s", exc)
+                self.completion_cb.emit_completion(self.ant)
             except Exception as exc:
                 self.log.error("Tracker %s failed: %s", cmd, exc)
+                self.completion_cb.emit_completion(self.ant)
 
 class RecorderCmdThread(threading.Thread):
     """Thread handling start/stop/param-set commands for a shared Recorder."""
@@ -481,15 +567,108 @@ class AntUI:
     duration: QDoubleSpinBox
     chk_no_slew: QCheckBox
     chk_no_park: QCheckBox
+    status_label: QLabel
     prog: QProgressBar
     lbl_pos: QLabel
     box: QGroupBox
+    # RASTA scan controls
+    rasta_max_dist: QDoubleSpinBox
+    rasta_step: QDoubleSpinBox
+    rasta_position_angle: QDoubleSpinBox
+    btn_rasta: QPushButton
+    pointing_dist: QDoubleSpinBox
+    pointing_npts: QSpinBox
+    btn_point: QPushButton
+
+class FTXPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.controllers = {
+            (Antenna.NORTH, 0): FTXController(Antenna.NORTH),
+            (Antenna.NORTH, 1): FTXController(Antenna.NORTH),
+            (Antenna.SOUTH, 0): FTXController(Antenna.SOUTH),
+            (Antenna.SOUTH, 1): FTXController(Antenna.SOUTH),
+        }
+        self.init_ui()
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_all)
+        self.refresh_timer.start(3000)  # every 3 seconds
+        self.refresh_all()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        title = QLabel("FTX Monitor & Control")
+        title.setStyleSheet("font-weight: bold; font-size: 14pt;")
+        layout.addWidget(title)
+        self.blocks = {}
+        for ant in [Antenna.NORTH, Antenna.SOUTH]:
+            for pol in [0, 1]:
+                block = self._make_block(ant, pol)
+                layout.addWidget(block['group'])
+                self.blocks[(ant, pol)] = block
+        layout.addStretch()
+
+    def _make_block(self, ant, pol):
+        label_map = {
+            (Antenna.NORTH, 0): "Y(N)",
+            (Antenna.NORTH, 1): "X(N)",
+            (Antenna.SOUTH, 0): "Y(S)",
+            (Antenna.SOUTH, 1): "X(S)",
+        }
+        group_label = label_map.get((ant, pol), f"{ant.value} Pol {pol}")
+        group = QGroupBox(group_label)
+        v = QVBoxLayout(group)
+        # Monitor labels
+        labels = {}
+        for key in ["attenuation", "rf_power", "laser_current"]:
+            lbl = QLabel(f"{key.replace('_',' ').title()}: --")
+            v.addWidget(lbl)
+            labels[key] = lbl
+        # Controls
+        h = QHBoxLayout()
+        atten = QDoubleSpinBox(); atten.setRange(0, 31.75); atten.setSingleStep(0.25); atten.setDecimals(2)
+        laser = QDoubleSpinBox(); laser.setRange(0, 50); laser.setDecimals(2)
+        lna = QCheckBox("LNA Enable"); lna.setChecked(True)
+        btn = QPushButton("Set")
+        h.addWidget(QLabel("Atten (dB)")); h.addWidget(atten)
+        h.addWidget(QLabel("Laser (mA)")); h.addWidget(laser)
+        h.addWidget(lna); h.addWidget(btn)
+        v.addLayout(h)
+        # Connect set button
+        btn.clicked.connect(lambda _, a=ant, p=pol, at=atten, la=laser, ln=lna: self.set_ftx(a, p, at.value(), la.value(), ln.isChecked()))
+        return {'group': group, 'labels': labels, 'atten': atten, 'laser': laser, 'lna': lna}
+
+    def refresh_all(self):
+        for (ant, pol), block in self.blocks.items():
+            try:
+                ctrl = self.controllers[(ant, pol)]
+                data = ctrl.get_monitor_data(pol)
+                block['labels']['attenuation'].setText(f"Attenuation: {data.attenuation_db:.2f} dB")
+                block['labels']['rf_power'].setText(f"RF Power: {data.rf_power_dbm:.2f} dBm")
+                block['labels']['laser_current'].setText(f"Laser Current: {data.ld_current_ma:.2f} mA")
+                # Optionally prefill controls with current values
+                block['atten'].setValue(data.attenuation_db)
+                block['laser'].setValue(data.ld_current_ma)
+                # block['lna'].setChecked(...) # If you can infer
+            except Exception as e:
+                for lbl in block['labels'].values():
+                    lbl.setText(f"Error: {e}")
+
+    def set_ftx(self, ant, pol, atten_db, laser_ma, lna_enabled):
+        ctrl = self.controllers[(ant, pol)]
+        try:
+            ctrl.set_attenuation(pol, atten_db)
+            ctrl.set_laser_current(pol, laser_ma)
+            ctrl.set_lna_enabled(pol, lna_enabled)
+        except Exception as e:
+            # Optionally show error in UI
+            pass
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Antenna & Recorder Control")
-        self.resize(900, 600)
+        self.resize(900, 400)
 
         # Initialize components
         self._setup_logging()
@@ -557,6 +736,10 @@ class MainWindow(QMainWindow):
         self.br_pos_n.position_signal.connect(self._update_antenna_position)
         self.br_pos_s.position_signal.connect(self._update_antenna_position)
         
+        # Completion bridge
+        self.br_completion = TrackerCompletionBridge()
+        self.br_completion.completion_signal.connect(self._reset_tracker_status)
+        
         # Data bridge
         self.br_data = DataBufferBridge()
         self.br_data.data_signal.connect(self._update_data_buffer)
@@ -564,8 +747,8 @@ class MainWindow(QMainWindow):
     def _setup_threads(self):
         """Initialize and start all worker threads."""
         # Create threads
-        self.thr_trk_n = TrackerThread("N", self.br_trk_n, self.root_log)
-        self.thr_trk_s = TrackerThread("S", self.br_trk_s, self.root_log)
+        self.thr_trk_n = TrackerThread("N", self.br_trk_n, self.br_completion, self.root_log)
+        self.thr_trk_s = TrackerThread("S", self.br_trk_s, self.br_completion, self.root_log)
         self.thr_rec_cmd = RecorderCmdThread(self.recorder, self.br_rec, self.root_log)
         self.thr_rec_status = RecorderStatusThread(self.recorder, self.br_status, self.br_data, self.root_log)
         self.thr_pos_n = AntennaPositionThread("N", self.br_pos_n, self.root_log)
@@ -583,7 +766,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         h = QHBoxLayout(central)
 
-        # Left side: Antenna panels and recording controls
+        # Left column: Antenna panels (fixed width)
         v_left = QVBoxLayout()
         
         # Antenna panels
@@ -591,14 +774,36 @@ class MainWindow(QMainWindow):
         self.ui_s = self._build_ant_panel("South", "S")
         v_left.addWidget(self.ui_n.box)
         v_left.addWidget(self.ui_s.box)
-        
-        # Recording controls
-        v_left.addWidget(self._build_rec_panel())
         v_left.addStretch()
         
-        h.addLayout(v_left, 1)
+        # Set left column to fixed size
+        left_widget = QWidget()
+        left_widget.setLayout(v_left)
+        left_widget.setFixedWidth(450)  # Fixed width for left column
+        h.addWidget(left_widget)
 
-        # Right side: Plot and logs
+        # Middle column: Recording controls and coordinate calculations (fixed width)
+        v_middle = QVBoxLayout()
+        
+        # Recording controls
+        v_middle.addWidget(self._build_rec_panel())
+        
+        # Coordinate calculation controls
+        v_middle.addWidget(self._build_coord_panel())
+        v_middle.addStretch()
+        
+        # Set middle column to fixed size
+        middle_widget = QWidget(); middle_widget.setLayout(v_middle); middle_widget.setFixedWidth(300)
+        h.addWidget(middle_widget)
+
+        # FTX column (new, fixed width)
+        v_ftx = QVBoxLayout()
+        self.ftx_panel = FTXPanel()
+        v_ftx.addWidget(self.ftx_panel)
+        ftx_widget = QWidget(); ftx_widget.setLayout(v_ftx); ftx_widget.setFixedWidth(350)
+        h.addWidget(ftx_widget)
+
+        # Right column: Plot and logs (expandable)
         v_right = QVBoxLayout()
         
         # Plot widget
@@ -610,14 +815,26 @@ class MainWindow(QMainWindow):
         # Log panels
         v_right.addLayout(self._build_log_panels())
         
-        h.addLayout(v_right, 1)
+        # Set right column to expand
+        right_widget = QWidget()
+        right_widget.setLayout(v_right)
+        h.addWidget(right_widget, 1)  # Stretch factor of 1 for expansion
 
     # --------------- Antenna panel ------------------
     def _build_ant_panel(self, title: str, ant: str) -> AntUI:
         box = QGroupBox(title)
         v = QVBoxLayout(box)
         
-        # Track row
+        # Status label row
+        status_label = QLabel("Idle")
+        status_label.setStyleSheet("QLabel { color: blue; font-weight: bold; }")
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel(f"Status:"))
+        status_row.addWidget(status_label)
+        status_row.addStretch()
+        v.addLayout(status_row)
+        
+        # Track/RASTA row (shared RA/Dec coordinates)
         ra = QDoubleSpinBox()
         ra.setRange(0, 24)
         ra.setDecimals(4)
@@ -625,23 +842,62 @@ class MainWindow(QMainWindow):
         dec.setRange(-90, 90)
         dec.setDecimals(4)
         duration = QDoubleSpinBox()
-        duration.setRange(0.1, 24.0)
+        duration.setRange(0.0, 24.0)
         duration.setValue(1.0)
-        duration.setDecimals(2)
-        btn_track = QPushButton("Track")
+        duration.setDecimals(4)
+        btn_track = QPushButton("TRACK")
+        btn_track.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")  # Green button
         
         row = QHBoxLayout()
-        row.addWidget(QLabel("RA"))
+        row.addWidget(QLabel("RA(h)"))
         row.addWidget(ra)
-        row.addWidget(QLabel("Dec"))
+        row.addWidget(QLabel("Dec(°)"))
         row.addWidget(dec)
-        row.addWidget(QLabel("Duration(h)"))
+        row.addWidget(QLabel("Length(h)"))
         row.addWidget(duration)
         row.addWidget(btn_track)
         v.addLayout(row)
         
-        # Track options row
-        from PyQt5.QtWidgets import QCheckBox
+        # RASTA scan controls - single row
+        rasta_max_dist = QDoubleSpinBox()
+        rasta_max_dist.setRange(0.1, 50.0)
+        rasta_max_dist.setDecimals(2)
+        rasta_max_dist.setValue(10.0)
+        rasta_step = QDoubleSpinBox()
+        rasta_step.setRange(0.1, 2.0)
+        rasta_step.setDecimals(2)
+        rasta_step.setValue(0.5)
+        rasta_position_angle = QDoubleSpinBox()
+        rasta_position_angle.setRange(0, 360)
+        rasta_position_angle.setDecimals(1)
+        rasta_position_angle.setValue(0.0)
+        btn_rasta = QPushButton("RASTA")
+        btn_rasta.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")  # Green button
+        
+        rasta_row = QHBoxLayout()
+        rasta_row.addWidget(QLabel("Max(°)"))
+        rasta_row.addWidget(rasta_max_dist)
+        rasta_row.addWidget(QLabel("Step(°)"))
+        rasta_row.addWidget(rasta_step)
+        rasta_row.addWidget(QLabel("Angle(°)"))
+        rasta_row.addWidget(rasta_position_angle)
+        rasta_row.addWidget(btn_rasta)
+        v.addLayout(rasta_row)
+
+        # POINTING (offset pattern) controls – single row just below RASTA
+        pointing_dist = QDoubleSpinBox(); pointing_dist.setRange(0.01, 20.0); pointing_dist.setDecimals(2); pointing_dist.setValue(0.5)
+        pointing_npts = QSpinBox(); pointing_npts.setRange(5, 13); pointing_npts.setSingleStep(2); pointing_npts.setValue(5)
+        btn_point = QPushButton("POINTING SCAN")
+        btn_point.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")  # Green button
+
+
+        pointing_row = QHBoxLayout()
+        pointing_row.addWidget(QLabel("Dist(°)")); pointing_row.addWidget(pointing_dist)
+        pointing_row.addWidget(QLabel("Npts")); pointing_row.addWidget(pointing_npts)
+        pointing_row.addWidget(btn_point)
+        v.addLayout(pointing_row)
+        
+        # Track/RASTA/POINTING options row (shared)
         chk_no_slew = QCheckBox("No Slew")
         chk_no_park = QCheckBox("No Park")
         
@@ -658,23 +914,28 @@ class MainWindow(QMainWindow):
         el = QDoubleSpinBox()
         el.setRange(0, 90)
         el.setDecimals(2)
-        btn_slew = QPushButton("Slew")
+        btn_slew = QPushButton("SLEW")
+        btn_slew.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")  # Green button
         
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Az"))
+        row2.addWidget(QLabel("Az(°)"))
         row2.addWidget(az)
-        row2.addWidget(QLabel("El"))
+        row2.addWidget(QLabel("El(°)"))
         row2.addWidget(el)
         row2.addWidget(btn_slew)
         v.addLayout(row2)
         
         # Park/Stop
-        btn_park = QPushButton("Park")
-        btn_stop = QPushButton("Stop")
+        btn_park = QPushButton("PARK")
+        btn_park.setStyleSheet("QPushButton { background-color: orange; color: white; }")  # Orange button
+        btn_stop = QPushButton("STOP")
+        btn_stop.setStyleSheet("QPushButton { background-color: #f44336; color: white; }")  # Red button
         row3 = QHBoxLayout()
         row3.addWidget(btn_park)
         row3.addWidget(btn_stop)
         v.addLayout(row3)
+        
+
         
         # Position display
         lbl_pos = QLabel("Position: --")
@@ -692,12 +953,24 @@ class MainWindow(QMainWindow):
         btn_park.clicked.connect(lambda: self._cmd_park(ant))
         btn_stop.clicked.connect(lambda: self._cmd_stop(ant))
         
-        return AntUI(ra, dec, az, el, duration, chk_no_slew, chk_no_park, prog, lbl_pos, box)
+        btn_rasta.clicked.connect(lambda: self._cmd_rasta_scan(ant, ra.value(), dec.value(), rasta_max_dist.value(), rasta_step.value(), rasta_position_angle.value(), duration.value(), chk_no_slew.isChecked(), chk_no_park.isChecked()))
+        btn_point.clicked.connect(lambda: self._cmd_pointing_offsets(ant, ra.value(), dec.value(), pointing_dist.value(), pointing_npts.value(), duration.value(), chk_no_slew.isChecked(), chk_no_park.isChecked()))
+        
+        return AntUI(ra, dec, az, el, duration, chk_no_slew, chk_no_park, status_label, prog, lbl_pos, box, rasta_max_dist, rasta_step, rasta_position_angle, btn_rasta, pointing_dist, pointing_npts, btn_point)
 
     # --------------- Recorder panel ------------------
     def _build_rec_panel(self):
         box = QGroupBox("Recorder")
         h = QVBoxLayout(box)
+        
+        # Status label row
+        self.recorder_status_label = QLabel("Idle")
+        self.recorder_status_label.setStyleSheet("QLabel { color: blue; font-weight: bold; }")
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel("Status:"))
+        status_row.addWidget(self.recorder_status_label)
+        status_row.addStretch()
+        h.addLayout(status_row)
         
         # Top row controls
         row = QHBoxLayout()
@@ -707,29 +980,94 @@ class MainWindow(QMainWindow):
         self.sp_acc = QSpinBox()
         self.sp_acc.setRange(1, 1_000_000)
         self.sp_acc.setValue(131072)
-        self.btn_start = QPushButton("Start")
-        self.btn_set = QPushButton("Set Params")
         
         row.addWidget(QLabel("fftshift"))
         row.addWidget(self.sp_fft)
         row.addWidget(QLabel("acclen"))
         row.addWidget(self.sp_acc)
-        row.addWidget(self.btn_start)
-        row.addWidget(self.btn_set)
         h.addLayout(row)
         
+        # Buttons row
+        btn_row = QHBoxLayout()
+        self.btn_start = QPushButton("Start")
+        self.btn_set = QPushButton("Set Params")
+        btn_row.addWidget(self.btn_start)
+        btn_row.addWidget(self.btn_set)
+        h.addLayout(btn_row)
+        
         # Status row
-        self.lbl_status = QLabel("Idle")
         self.lbl_fft = QLabel("FFT: -, -")
         self.lbl_acc = QLabel("AccLen: -")
         self.lbl_ovf = QLabel("Overflow: -, -")
         
-        for lab in (self.lbl_status, self.lbl_fft, self.lbl_acc, self.lbl_ovf):
+        for lab in (self.lbl_fft, self.lbl_acc, self.lbl_ovf):
             h.addWidget(lab)
         
         # Connect signals
         self.btn_start.clicked.connect(self._toggle_record)
         self.btn_set.clicked.connect(self._apply_params)
+        
+        return box
+
+    # --------------- Coordinate calculation panel ------------------
+    def _build_coord_panel(self):
+        box = QGroupBox("Coordinate Calculations")
+        layout = QVBoxLayout(box)
+        
+        # Input row
+        input_row = QHBoxLayout()
+        self.coord_ra = QDoubleSpinBox()
+        self.coord_ra.setRange(0, 24)
+        self.coord_ra.setDecimals(4)
+        self.coord_ra.setValue(12.0)
+        self.coord_dec = QDoubleSpinBox()
+        self.coord_dec.setRange(-90, 90)
+        self.coord_dec.setDecimals(4)
+        self.coord_dec.setValue(45.0)
+        
+        input_row.addWidget(QLabel("RA(h):"))
+        input_row.addWidget(self.coord_ra)
+        input_row.addWidget(QLabel("Dec(°):"))
+        input_row.addWidget(self.coord_dec)
+        layout.addLayout(input_row)
+        
+        # Buttons row
+        button_row = QHBoxLayout()
+        self.btn_get_offsets = QPushButton("Get Offsets")
+        self.btn_get_azel = QPushButton("Get Az/El")
+        self.btn_clear_results = QPushButton("Clear Results")
+        
+        button_row.addWidget(self.btn_get_offsets)
+        button_row.addWidget(self.btn_get_azel)
+        button_row.addWidget(self.btn_clear_results)
+        layout.addLayout(button_row)
+        
+        # Offset parameters row
+        offset_row = QHBoxLayout()
+        self.offset_amplitude = QDoubleSpinBox()
+        self.offset_amplitude.setRange(0.1, 10.0)
+        self.offset_amplitude.setDecimals(2)
+        self.offset_amplitude.setValue(0.5)
+        self.offset_count = QSpinBox()
+        self.offset_count.setRange(5, 13)
+        self.offset_count.setValue(5)
+        
+        offset_row.addWidget(QLabel("Offset (deg):"))
+        offset_row.addWidget(self.offset_amplitude)
+        offset_row.addWidget(QLabel("Count:"))
+        offset_row.addWidget(self.offset_count)
+        layout.addLayout(offset_row)
+        
+        # Results display
+        self.txt_coord_results = QTextEdit()
+        self.txt_coord_results.setReadOnly(True)
+        self.txt_coord_results.setMaximumHeight(150)
+        layout.addWidget(self.txt_coord_results)
+        
+        # Connect signals
+        self.btn_get_offsets.clicked.connect(self._calculate_offsets)
+        self.btn_get_azel.clicked.connect(self._calculate_azel)
+        self.btn_clear_results.clicked.connect(self._clear_coord_results)
         
         return box
 
@@ -783,17 +1121,55 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Command helpers
     def _cmd_track(self, ant: str, ra: float, dec: float, duration: float, no_slew: bool = False, no_park: bool = False):
-        src = Source(ra, dec)
-        self._target_thr(ant).submit("track", source=src, duration_hours=duration, no_slew=no_slew, no_park=no_park)
+        src = Source(ra_hrs=ra, dec_deg=dec)
+        # Convert no_slew/no_park to slew/park (invert the logic)
+        slew = not no_slew
+        park = not no_park
+        self._target_thr(ant).submit("track", source=src, duration_hours=duration, slew=slew, park=park)
+        # Update status immediately
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText(f"Tracking {ra:.2f}h, {dec:.2f}°")
 
     def _cmd_slew(self, ant: str, az: float, el: float):
         self._target_thr(ant).submit("slew", az=az, el=el)
+        # Update status immediately
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText(f"Slewing {az:.2f}°, {el:.2f}°")
 
     def _cmd_park(self, ant: str):
         self._target_thr(ant).submit("park")
+        # Update status immediately
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText("Parking")
 
     def _cmd_stop(self, ant: str):
         self._target_thr(ant).request_stop()
+        # Update status immediately
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText("Stopping...")
+
+    def _cmd_rasta_scan(self, ant: str, ra: float, dec: float, max_dist: float, step: float, position_angle: float, duration: float, no_slew: bool = False, no_park: bool = False):
+        src = Source(ra_hrs=ra, dec_deg=dec)
+        
+        # Convert no_slew/no_park to slew/park (invert the logic)
+        slew = not no_slew
+        park = not no_park
+        
+        # Debug logging to see what values are being passed
+        print(f"DEBUG: RASTA scan called with duration={duration} hours")
+        print(f"DEBUG: All parameters: ra={ra}, dec={dec}, max_dist={max_dist}, step={step}, position_angle={position_angle}, duration={duration}, slew={slew}, park={park}")
+        
+        self._target_thr(ant).submit("rasta_scan", source=src, max_dist_deg=max_dist, step_deg=step, position_angle_deg=position_angle, duration_hours=duration, slew=slew, park=park)
+        # Update status immediately
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText(f"RASTA Scanning {ra:.2f}h, {dec:.2f}°")
+
+    def _cmd_pointing_offsets(self, ant: str, ra: float, dec: float, dist: float, npts: int, duration: float, no_slew: bool = False, no_park: bool = False):
+        src = Source(ra_hrs=ra, dec_deg=dec)
+        slew = not no_slew; park = not no_park
+        self._target_thr(ant).submit("pointing_offsets", source=src, closest_dist_deg=dist, number_of_points=npts, duration_hours=duration, slew=slew, park=park)
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText(f"POINTING {ra:.2f}h, {dec:.2f}°")
 
     def _target_thr(self, ant):
         return self.thr_trk_n if ant == "N" else self.thr_trk_s
@@ -802,22 +1178,57 @@ class MainWindow(QMainWindow):
         if self.btn_start.text() == "Start":
             self.thr_rec_cmd.submit("start", fftshift=self.sp_fft.value(), acclen=self.sp_acc.value())
             self.btn_start.setText("Stop")
+            self.recorder_status_label.setText("Recording")
         else:
             self.thr_rec_cmd.submit("stop")
             self.btn_start.setText("Start")
+            self.recorder_status_label.setText("Stopping...")
 
     def _apply_params(self):
         self.thr_rec_cmd.submit("set_params", fftshift=self.sp_fft.value(), acclen=self.sp_acc.value())
+        self.recorder_status_label.setText("Setting parameters...")
 
     # ------------------------------------------------------------------
     # Slots
     def _on_trk_progress(self, info: TrkProgInfo):
         ui = self.ui_n if info.antenna == "N" else self.ui_s
         ui.prog.setValue(int(info.percent_complete))
+        
+        # Update status label based on operation type
+        # Only set "Idle" when operation is actually complete (not just progress = 100%)
+        if hasattr(info, 'operation_type'):
+            if info.operation_type == 'track':
+                ui.status_label.setText(f"Tracking... ({info.percent_complete:.1f}%)")
+            elif info.operation_type == 'slew':
+                ui.status_label.setText(f"Slewing... ({info.percent_complete:.1f}%)")
+            elif info.operation_type == 'park':
+                ui.status_label.setText("Parking...")
+            elif info.operation_type == 'rasta_scan':
+                ui.status_label.setText(f"RASTA Scanning... ({info.percent_complete:.1f}%)")
+        else:
+            # Fallback based on progress info
+            if info.percent_complete < 100:
+                ui.status_label.setText("Operating...")
+            # Don't automatically set to "Idle" here - let the operation complete naturally
+        
+        # Check if tracking operation is complete and stop recording if active
+        if info.is_complete and info.operation_type in ['track', 'rasta_scan']:
+            if self.recorder.is_recording:
+                self.root_log.info(f"Tracking operation completed for antenna {info.antenna}, stopping recording")
+                self.thr_rec_cmd.submit("stop")
+                # Update UI to reflect that recording is being stopped
+                self.btn_start.setText("Start")
+                self.recorder_status_label.setText("Stopping...")
 
     def _on_rec_progress(self, info: RecProgInfo):
         pct = int(info.percent_complete)
         self.lbl_status.setText(f"Recording ({pct}%)" if not info.is_complete else "Idle")
+        
+        # Update recorder status label
+        if info.is_complete:
+            self.recorder_status_label.setText("Idle")
+        else:
+            self.recorder_status_label.setText(f"Recording ({pct}%)")
 
     def _update_rec_status(self, status: tuple):
         fft0, fft1, acc, ovf0, ovf1, rec = status
@@ -825,16 +1236,10 @@ class MainWindow(QMainWindow):
         self.lbl_acc.setText(f"AccLen: {acc}")
         self.lbl_ovf.setText(f"Overflow: {ovf0}, {ovf1}")
         
-        # Add buffer size information
-        try:
-            buffer_size = self.recorder.get_buffer_size()
-            self.lbl_status.setText(f"{'Recording' if rec else 'Idle'} (Buffer: {buffer_size})")
-        except:
-            self.lbl_status.setText("Idle" if not rec else "Recording")
-            
         if not rec and self.btn_start.text() == "Stop":
             self.btn_start.setText("Start")
-            self.lbl_status.setText("Idle")
+            # Also reset the recorder status label when recording stops
+            self.recorder_status_label.setText("Idle")
 
     def _update_antenna_position(self, antenna: str, az: float, el: float):
         """Update antenna position display."""
@@ -939,7 +1344,7 @@ class MainWindow(QMainWindow):
                 self.plot_widget.draw()
                 return
             
-            labels = ["XX1", "YY1", "XX2", "YY2"]
+            labels = ["XX(S)", "YY(S)", "XX(N)", "YY(N)"]
             colors = ['blue', 'red', 'green', 'orange']
             
             plotted_lines = []  # Track if we actually plot anything
@@ -967,7 +1372,7 @@ class MainWindow(QMainWindow):
             ax.set_ylabel("Amplitude (arb. dB)", fontsize=12)
             # ax.set_xlim(1600, 1750)
             # ax.set_ylim(-60, -40)
-            ax.set_title(f"Autocorrs - {len(data_buffer)} time samples", fontsize=12)
+            ax.set_title(f"Autocorrs - {len(data_buffer)} time integrations", fontsize=12)
             ax.grid(True, alpha=0.3)
             
         except Exception as e:
@@ -984,6 +1389,67 @@ class MainWindow(QMainWindow):
     def _append_rec_log(self, txt: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self.txt_log_rec.append(f"[{ts}] {txt}")
+
+    # ------------------------------------------------------------------
+    # Coordinate calculation methods
+    # ------------------------------------------------------------------
+    def _calculate_offsets(self):
+        """Calculate RA/Dec offsets and display results."""
+        try:
+            ra = self.coord_ra.value()
+            dec = self.coord_dec.value()
+            amp_offset = self.offset_amplitude.value()
+            num_offsets = self.offset_count.value()
+            
+            ra_list, dec_list = get_targets_offsets(amp_offset, num_offsets, ra, dec)
+            
+            # Format results
+            result_text = f"RA/Dec Offsets (amplitude: {amp_offset}°, count: {num_offsets}):\n"
+            result_text += f"Center: RA={ra:.4f}h, Dec={dec:.4f}°\n\n"
+            
+            for i, (ra_val, dec_val) in enumerate(zip(ra_list, dec_list)):
+                result_text += f"Point {i+1}: RA={ra_val:.4f}h, Dec={dec_val:.4f}°\n"
+            
+            self.txt_coord_results.setText(result_text)
+            
+        except Exception as e:
+            self.txt_coord_results.setText(f"Error calculating offsets: {str(e)}")
+
+    def _calculate_azel(self):
+        """Calculate Az/El for the given RA/Dec and display results."""
+        try:
+            ra = self.coord_ra.value()
+            dec = self.coord_dec.value()
+            
+            az, el = radec_to_azel(ra, dec)
+            
+            # Format results
+            result_text = f"Azimuth/Elevation for RA={ra:.4f}h, Dec={dec:.4f}°:\n"
+            result_text += f"Azimuth: {az:.2f}°\n"
+            result_text += f"Elevation: {el:.2f}°\n\n"
+            result_text += get_ovro_location_info()
+            
+            self.txt_coord_results.setText(result_text)
+            
+        except Exception as e:
+            self.txt_coord_results.setText(f"Error calculating Az/El: {str(e)}")
+
+    def _clear_coord_results(self):
+        """Clear the coordinate results display."""
+        self.txt_coord_results.clear()
+
+    def _reset_tracker_status(self, ant: str):
+        """Reset tracker status to Idle when operation completes and stop recording if active."""
+        ui = self.ui_n if ant == "N" else self.ui_s
+        ui.status_label.setText("Idle")
+        
+        # Stop recording if it's currently active
+        if self.recorder.is_recording:
+            self.root_log.info(f"Tracking operation completed for antenna {ant}, stopping recording")
+            self.thr_rec_cmd.submit("stop")
+            # Update UI to reflect that recording is being stopped
+            self.btn_start.setText("Start")
+            self.recorder_status_label.setText("Stopping...")
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):  # pylint: disable=invalid-name

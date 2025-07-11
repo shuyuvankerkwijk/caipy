@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import os
 import signal
+import numpy as np
 from time import sleep, time
 from enum import Enum
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Callable, Any, Union
+from typing import Optional, Callable, Any, Union, List
 import logging
+from astropy.coordinates import SkyCoord
+from astropy import units as u
+
 
 from tracking.utils.helpers import xel2az, sync_to_half_second, angular_separation
 from tracking.core.astro_pointing import AstroPointing
@@ -20,6 +24,7 @@ from tracking.utils.exceptions import (
 from tracking.utils.colors import Colors
 from tracking.utils.progress import ProgressCallback, ProgressInfo, OperationType
 from tracking.utils.helpers import d2m
+from tracking.utils.coordinate_utils import get_targets_offsets
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -52,7 +57,6 @@ class Tracker:
         self.pointing = AstroPointing()
         self.mqtt = MqttController()
         self.ant: Optional[str] = None
-        self.target: Optional[Source] = None
         self.state: State = State.IDLE
         self._is_initialized: bool = False
         
@@ -93,7 +97,7 @@ class Tracker:
         logger.info(f"Duration: {duration_hours:.4f} hours")
 
         try:
-            if not self._setup(ant, source):
+            if not self._setup(ant):
                 raise OperationError("Failed to setup tracker")
 
             # Validate target coordinates
@@ -102,7 +106,7 @@ class Tracker:
             # Slew to target if requested
             if slew:
                 logger.info(f"{Colors.BLUE}Slewing to target...{Colors.RESET}")
-                if not self._slew(progress_callback=progress_callback):
+                if not self._slew(source=source, progress_callback=progress_callback):
                     raise OperationError("Slewing failed")
 
             # Track source
@@ -116,7 +120,7 @@ class Tracker:
                 )
                 progress_callback(progress_info)
             
-            if not self._track(duration_hours, progress_callback=progress_callback):
+            if not self._track(source, duration_hours, progress_callback=progress_callback):
                 raise OperationError("Tracking failed")
 
             # Park if requested
@@ -165,14 +169,14 @@ class Tracker:
         logger.info(f"{Colors.BLUE}Starting slew operation for antenna {ant}{Colors.RESET}")
         
         try:
-            if not self._setup(ant, source):
+            if not self._setup(ant):
                 raise OperationError("Failed to setup tracker")
 
             # Validate and slew to target
             if source is not None:
                 self._validate_target(source, ant)
                 logger.info(f"Target coordinates: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
-                if not self._slew(progress_callback=progress_callback):
+                if not self._slew(source=source, progress_callback=progress_callback):
                     raise OperationError("Slewing failed")
 
             elif az is not None and el is not None:
@@ -303,8 +307,6 @@ class Tracker:
             logger.warning(f"{Colors.RED}MQTT controller not initialized{Colors.RESET}")
 
         # Reset state
-        if hasattr(self, 'target') and self.target is not None:
-            self.target = None
         if hasattr(self, 'ant') and self.ant is not None:
             self.ant = None
         if hasattr(self, 'state') and self.state is not None:
@@ -312,6 +314,200 @@ class Tracker:
         self._is_initialized = False
 
         logger.info(f"{Colors.GREEN}Cleanup complete{Colors.RESET}")
+
+    # ============================================================================
+    # SPECIALTY METHODS
+    # ============================================================================
+
+    def run_rasta_scan(self, ant: str, source: Source, max_distance_deg: float, steps_deg: float, position_angle_deg: float, duration_hours: float, 
+                       slew: bool = True, park: bool = True,
+                       progress_callback: Optional[ProgressCallback] = None,
+                       auto_cleanup: bool = True) -> bool:
+        """
+        Run a Rasta scan. Returns True if successful, False otherwise.
+        
+        Args:
+            ant: Antenna identifier ("N" or "S")
+            source: Source object with coordinates
+            max_distance_deg: Maximum distance from center in degrees
+            steps_deg: Step size in degrees
+            position_angle_deg: Position angle for the scan in degrees
+            duration_hours: Duration to track at each position in hours
+            slew: Whether to slew to target before scanning (default: True)
+            park: Whether to park after scanning (default: True)
+            progress_callback: Optional ProgressCallback for detailed progress updates
+            auto_cleanup: Whether to automatically cleanup and disconnect MQTT (default: True)
+            
+        Returns:
+            bool: True if successful, False otherwise
+            
+        Raises:
+            ValidationError: If input parameters are invalid
+            SafetyError: If safety checks fail
+            MQTTError: If MQTT communication fails
+            OperationError: If tracking operation fails
+        """
+        logger.info(f"{Colors.BLUE}Starting Rasta scan for antenna {ant}{Colors.RESET}")
+        logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
+        logger.info(f"Max distance: {max_distance_deg:.2f}°, Steps: {steps_deg:.2f}°")
+        logger.info(f"Duration: {duration_hours:.2f} hours at each step")
+
+        # Validate input parameters
+        if max_distance_deg <= 0:
+            raise ValidationError(f"max_distance_deg must be positive, got {max_distance_deg}")
+        if steps_deg <= 0:
+            raise ValidationError(f"steps_deg must be positive, got {steps_deg}")
+        if duration_hours <= 0:
+            raise ValidationError(f"duration_hours must be positive, got {duration_hours}")
+        if steps_deg > max_distance_deg:
+            raise ValidationError(f"steps_deg ({steps_deg}) cannot be larger than max_distance_deg ({max_distance_deg})")
+
+        # Make a list of steps
+        steps = np.arange(-max_distance_deg, max_distance_deg + steps_deg, steps_deg)
+        if len(steps) == 0:
+            raise ValidationError("No scan positions generated. Check max_distance_deg and steps_deg values.")
+            
+        center_coord = SkyCoord(ra=source.ra_hrs*u.hourangle, dec=source.dec_deg*u.deg)
+        sources = []
+
+        for step in steps:
+            offset_coord = center_coord.directional_offset_by(
+                position_angle=position_angle_deg*u.deg,
+                separation=step*u.deg
+            )
+            sources.append(Source(ra_hrs=offset_coord.ra.hour, dec_deg=offset_coord.dec.deg))
+
+        logger.info(f"Generated {len(sources)} scan positions")
+
+        try:
+            if not self._setup(ant):
+                raise OperationError("Failed to setup tracker")
+
+            # Validate each source individually with its own duration
+            total_duration = duration_hours * len(sources)
+            for i, scan_source in enumerate(sources):
+                logger.debug(f"Validating scan position {i+1}/{len(sources)}")
+                self._validate_target(scan_source, ant, duration_hours)
+
+            # Also perform a total duration safety check with the center source
+            logger.info(f"Performing total duration safety check ({total_duration:.2f} hours)")
+            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, total_duration)
+            if not safety_result.is_safe:
+                raise SafetyError(f"Total duration safety check failed: {safety_result.message}")
+
+            # Slew to first target position if requested
+            if slew:
+                logger.info(f"{Colors.BLUE}Slewing to first scan position...{Colors.RESET}")
+                if not self._slew(source=sources[0], progress_callback=progress_callback):
+                    raise OperationError("Slewing to first position failed")
+            
+            # Track source at every offset
+            if not self._rasta_scan(sources, duration_hours, progress_callback):
+                raise OperationError("Rasta scan failed")
+
+            logger.info(f"{Colors.GREEN}Rasta scan completed successfully{Colors.RESET}")
+
+            # Park the telescope if requested
+            if park:
+                logger.info(f"{Colors.BLUE}Parking telescope...{Colors.RESET}")
+                if not self._park(progress_callback=progress_callback):
+                    raise OperationError("Parking failed")
+
+            return True
+            
+        except (SafetyError, MQTTError, ValidationError, OperationError) as e:
+            logger.error(f"{Colors.RED}Rasta scan failed: {e}{Colors.RESET}")
+            raise
+        except Exception as e:
+            error_msg = f"Unexpected error in rasta scan: {e}"
+            logger.error(f"{Colors.RED}{error_msg}{Colors.RESET}")
+            raise OperationError(error_msg)
+        finally:
+            self._cleanup(auto_cleanup)
+
+    def run_pointing_offsets(self, ant: str, source: Source, closest_distance_deg: float, number_of_points: int,
+                             duration_hours: float, slew: bool = True, park: bool = True,
+                             progress_callback: Optional[ProgressCallback] = None,
+                             auto_cleanup: bool = True) -> bool:
+        """Run a pointing-offset pattern (cross / triangle etc.) around *source*.
+
+        This helper generates *number_of_points* offsets (5, 7, 9, 13 supported – see
+        ``coordinate_utils.get_targets_offsets``) at *closest_distance_deg* from the
+        centre and tracks each position for *duration_hours*.
+
+        Except for the way the offset list is generated this is identical to
+        :py:meth:`run_rasta_scan` and therefore re-uses the same validation, slew,
+        tracking and parking logic.
+        """
+        logger.info(f"{Colors.BLUE}Starting pointing-offset scan for antenna {ant}{Colors.RESET}")
+        logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
+        logger.info(f"Closest distance: {closest_distance_deg:.2f}°, Points: {number_of_points}")
+        logger.info(f"Duration: {duration_hours:.2f} hours at each point")
+
+        # Basic validation of arguments
+        if closest_distance_deg <= 0:
+            raise ValidationError(f"closest_distance_deg must be positive, got {closest_distance_deg}")
+        if number_of_points <= 0:
+            raise ValidationError(f"number_of_points must be positive, got {number_of_points}")
+        if duration_hours <= 0:
+            raise ValidationError(f"duration_hours must be positive, got {duration_hours}")
+
+        try:
+            ra_list, dec_list = get_targets_offsets(closest_distance_deg, number_of_points,
+                                                    source.ra_hrs, source.dec_deg)
+        except NotImplementedError as e:
+            raise ValidationError(str(e)) from e
+
+        sources = [Source(ra_hrs=ra, dec_deg=dec) for ra, dec in zip(ra_list, dec_list)]
+        logger.info(f"Generated {len(sources)} pointing-offset positions")
+
+        # Total duration for safety check
+        total_duration = duration_hours * len(sources)
+
+        try:
+            if not self._setup(ant):
+                raise OperationError("Failed to setup tracker")
+
+            # Validate each individual source
+            for idx, scan_source in enumerate(sources):
+                logger.debug(f"Validating offset position {idx+1}/{len(sources)}")
+                self._validate_target(scan_source, ant, duration_hours)
+
+            # Perform combined safety check at centre for total duration
+            logger.info(f"Performing total duration safety check ({total_duration:.2f} hours)")
+            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, total_duration)
+            if not safety_result.is_safe:
+                raise SafetyError(f"Total duration safety check failed: {safety_result.message}")
+
+            # Optional slew to first point
+            if slew:
+                logger.info(f"{Colors.BLUE}Slewing to first offset position...{Colors.RESET}")
+                if not self._slew(source=sources[0], progress_callback=progress_callback):
+                    raise OperationError("Slewing to first position failed")
+
+            # Track each offset using existing _rasta_scan helper
+            if not self._rasta_scan(sources, duration_hours, progress_callback):
+                raise OperationError("Pointing-offset scan failed")
+
+            logger.info(f"{Colors.GREEN}Pointing-offset scan completed successfully{Colors.RESET}")
+
+            # Optional park after completion
+            if park:
+                logger.info(f"{Colors.BLUE}Parking telescope...{Colors.RESET}")
+                if not self._park(progress_callback=progress_callback):
+                    raise OperationError("Parking failed")
+
+            return True
+
+        except (SafetyError, MQTTError, ValidationError, OperationError) as e:
+            logger.error(f"{Colors.RED}Pointing-offset scan failed: {e}{Colors.RESET}")
+            raise
+        except Exception as e:
+            err_msg = f"Unexpected error in pointing-offset scan: {e}"
+            logger.error(f"{Colors.RED}{err_msg}{Colors.RESET}")
+            raise OperationError(err_msg)
+        finally:
+            self._cleanup(auto_cleanup)
 
     # ============================================================================
     # PRIVATE HELPER METHODS
@@ -329,13 +525,12 @@ class Tracker:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-    def _setup(self, ant: str, source: Optional[Source] = None) -> bool:
+    def _setup(self, ant: str) -> bool:
         """
         Setup the tracker for an operation.
         
         Args:
             ant: Antenna identifier
-            source: Optional source object
             
         Returns:
             bool: True if setup successful, False otherwise
@@ -349,10 +544,8 @@ class Tracker:
             antenna_changed = hasattr(self, 'ant') and self.ant != ant
             needs_mqtt_setup = not self._is_initialized or antenna_changed
             
-            # Set antenna and source
+            # Set antenna
             self.ant = ant
-            if source is not None:
-                self.target = source
             
             # Connect to MQTT only if needed
             if needs_mqtt_setup:
@@ -392,7 +585,125 @@ class Tracker:
         if not validation_result.is_safe:
             raise SafetyError(f"Target validation failed: {validation_result.message}")
 
-    def _track(self, duration_hours: float, 
+    def _rasta_scan(self, sources: List[Source], duration_hours: float, progress_callback: Optional[ProgressCallback] = None) -> bool:
+        """
+        Track multiple sources for a given duration. Returns True if successful, False otherwise.
+        
+        Args:
+            sources: List of Source objects to track
+            duration_hours: Duration to track each source in hours
+            progress_callback: Optional ProgressCallback for detailed progress updates
+            
+        Returns:
+            bool: True if successful, False otherwise
+            
+        Raises:
+            ValidationError: If sources list is empty or invalid
+            OperationError: If tracking operation fails
+        """
+        logger.info(f"{Colors.BLUE}Starting rasta scan for {len(sources)} sources{Colors.RESET}")
+
+        # Validate sources list
+        if not sources:
+            raise ValidationError("Sources list cannot be empty")
+        
+        # Check if we're in the right state
+        if self.state != State.IDLE:
+            raise OperationError(f"Operation not completed. Current state: {self.state.value}. Please wait for current operation to complete.")
+        
+        # Check if we're close to the first target
+        offset = self._get_current_offset(sources[0]) 
+        if offset > config.telescope.start_tracking_tolerance:
+            raise OperationError(f"Too far away from first target. Offset: {offset:.2f} degrees.")
+
+        # Setup tracking
+        num_points = int(duration_hours * 3600 / config.telescope.position_update_interval)
+        logger.info(f"Setting up rasta scan for {num_points} points ({duration_hours:.2f} hours) for each of {len(sources)} sources")
+
+        self.state = State.TRACKING
+        self.mqtt.set_axis_mode_track()
+        self.mqtt.setup_program_track()
+        logger.info(f"{Colors.BLUE}MQTT setup complete{Colors.RESET}")
+
+        # Send zero start time to wake up broker
+        dzero = '0001-01-01T00:00:00.000'
+        self.mqtt.send_track_start_time(dzero)
+
+        # Send start time
+        logger.info(f"{Colors.BLUE}Synchronizing start time...{Colors.RESET}")
+        sync_to_half_second()
+        d0 = datetime.now(timezone.utc)
+        d0s = d0.microsecond / 1e6
+        if d0s > 0.5:
+            d0s = d0s - 0.5
+        ds = d0 - timedelta(seconds=d0s)
+        sst = ds + timedelta(seconds=3) + timedelta(seconds=1.173)
+        self.mqtt.send_track_start_time(d2m(sst))
+
+        logger.info(f"{Colors.BLUE}Starting tracking loop for {num_points} points ({duration_hours:.4f} hours){Colors.RESET}")
+        
+        total_sources = len(sources)
+        rt_offset = 0  # Track cumulative time across all sources
+
+        for source_idx, source in enumerate(sources):
+            for i in range(num_points):
+                # Check if motion stop requested
+                if self.state == State.STOP:
+                    raise OperationError("Tracking interrupted.")
+                
+                # Get time
+                ds = ds + timedelta(seconds=0.5)
+                d = ds + timedelta(seconds=2.5)
+                rt = rt_offset + i * 0.5  # Continuous relative time
+
+                # Get azel coordinates
+                mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
+                
+                # Send position command
+                self.mqtt.send_track_position(rt, mnt_az, mnt_el, ds)
+                
+                # Update progress - calculate overall progress across all sources
+                total_points = total_sources * num_points
+                current_point = source_idx * num_points + i + 1
+                percent = current_point / total_points * 100.0
+                
+                if progress_callback and (i + 1) % 1 == 0:  # Update every 1 points (0.5 seconds)
+                    progress_info = ProgressInfo(
+                        operation_type=OperationType.TRACK,
+                        antenna=self.ant,
+                        percent_complete=percent,
+                        message=f"Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s"
+                    )
+                    progress_callback(progress_info)
+                
+                # Log progress every 1 points (0.5 seconds)
+                if (i + 1) % 1 == 0:
+                    logger.info(f"{Colors.BLUE}Track progress: Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
+
+                        # Update rt_offset for next source
+            rt_offset += num_points * 0.5
+            
+            # Log completion of this source
+            logger.info(f"{Colors.GREEN}Completed tracking source {source_idx+1}/{total_sources}: {num_points} points processed{Colors.RESET}")
+        
+        # Send completion progress
+        if progress_callback:
+            progress_info = ProgressInfo(
+                operation_type=OperationType.TRACK,
+                antenna=self.ant,
+                percent_complete=100.0,
+                message="Rasta scan completed",
+                is_complete=True
+            )
+            progress_callback(progress_info)
+        
+        # Stop tracking
+        logger.info(f"{Colors.RED}Stopping scan{Colors.RESET}")
+        self.mqtt.set_axis_mode_stop()
+        self.state = State.IDLE
+        return True
+
+    def _track(self, source: Source, duration_hours: float, 
                progress_callback: Optional[ProgressCallback] = None) -> bool:
         """
         Track a source for a given duration. Returns True if successful, False otherwise.
@@ -404,7 +715,7 @@ class Tracker:
             raise OperationError(f"Operation not completed. Current state: {self.state.value}. Please wait for current operation to complete.")
         
         # Check if we're close to the target
-        offset = self._get_current_offset() 
+        offset = self._get_current_offset(source) 
         if offset > config.telescope.start_tracking_tolerance:
             raise OperationError(f"Too far away from target. Offset: {offset:.2f} degrees.")
 
@@ -423,13 +734,13 @@ class Tracker:
 
         # Send start time
         logger.info(f"{Colors.BLUE}Synchronizing start time...{Colors.RESET}")
-        sync_to_half_second()
-        d0 = datetime.now(timezone.utc)
-        d0s = d0.microsecond / 1e6
-        if d0s > 0.5:
+        sync_to_half_second() # wait until next half second boundary (x.0, x.5)
+        d0 = datetime.now(timezone.utc) # get current time
+        d0s = d0.microsecond / 1e6 # get fractional part of current second
+        if d0s > 0.5: 
             d0s = d0s - 0.5
-        ds = d0 - timedelta(seconds=d0s)
-        sst = ds + timedelta(seconds=config.telescope.delay) + timedelta(seconds=config.telescope.sto)
+        ds = d0 - timedelta(seconds=d0s) # get most recent 0.0 or 0.5 second boundary
+        sst = ds + timedelta(seconds=2.5) + timedelta(seconds=0.5) + timedelta(seconds=1.173) # add 3 seconds and 1.173 seconds to get scheduled start time
         self.mqtt.send_track_start_time(d2m(sst))
 
         # Track source
@@ -441,26 +752,26 @@ class Tracker:
                 raise OperationError("Tracking interrupted.")
             
             # Get time
-            ds = ds + timedelta(seconds=0.5)
-            d = ds + timedelta(seconds=2.5)
-            rt = i * 0.5
+            ds = ds + timedelta(seconds=0.5) # sending time
+            d = ds + timedelta(seconds=2.5) # sky time (calculate position 2.5 seconds ahead)
+            rt = i * 0.5 # relative time to sst
 
             # Get azel with detailed logging for first few points
             if i < 3:  # Log details for first 3 points
                 # Get coordinates without corrections first
-                raw_az, raw_el = self.pointing.radec2azel(self.target, self.ant, d, apply_corrections=False, apply_pointing_model=False, clip=False)
+                raw_az, raw_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=False, apply_pointing_model=False, clip=False)
                 logger.info(f"Point {i+1} raw coordinates: AZ={raw_az:.4f}°, EL={raw_el:.4f}°")
                 
                 # Get coordinates with corrections but no pointing model
-                corr_az, corr_el = self.pointing.radec2azel(self.target, self.ant, d, apply_corrections=True, apply_pointing_model=False, clip=False)
+                corr_az, corr_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=False, clip=False)
                 logger.info(f"Point {i+1} with corrections: AZ={corr_az:.4f}°, EL={corr_el:.4f}°")
                 
                 # Get final coordinates with everything applied
-                mnt_az, mnt_el = self.pointing.radec2azel(self.target, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
+                mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
                 logger.info(f"Point {i+1} final coordinates: AZ={mnt_az:.4f}°, EL={mnt_el:.4f}°")
             else:
                 # Get final coordinates for remaining points
-                mnt_az, mnt_el = self.pointing.radec2azel(self.target, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
+                mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
             
             # Send position command
             self.mqtt.send_track_position(rt, mnt_az, mnt_el, ds)
@@ -506,19 +817,22 @@ class Tracker:
         """
         return self._slew(az=config.telescope.park_azimuth, el=config.telescope.park_elevation, progress_callback=progress_callback)
 
-    def _slew(self, az: Optional[float] = None, el: Optional[float] = None, 
+    def _slew(self, source: Optional[Source] = None, az: Optional[float] = None, el: Optional[float] = None, 
               progress_callback: Optional[ProgressCallback] = None) -> bool:
         """
         Slew to a target position. Returns True if successful, False if interrupted or error.
         
         Args:
-            az: Optional azimuth in degrees. If None, uses self.target.
-            el: Optional elevation in degrees. If None, uses self.target.
+            source: Optional Source object with coordinates
+            az: Optional azimuth in degrees. If None, uses source.
+            el: Optional elevation in degrees. If None, uses source.
             progress_callback: Optional ProgressCallback for detailed progress updates.
         """
-        # Use provided coordinates or calculate from self.target
+        # Use provided coordinates or calculate from source
         if az is None and el is None:
-            target_az, target_el = self.pointing.radec2azel(self.target, self.ant, datetime.now(timezone.utc), apply_corrections=True, apply_pointing_model=True)
+            if source is None:
+                raise ValidationError("Either source or az/el coordinates must be provided")
+            target_az, target_el = self.pointing.radec2azel(source, self.ant, datetime.now(timezone.utc), apply_corrections=True, apply_pointing_model=True)
         else:
             target_az = az
             target_el = el
@@ -608,14 +922,18 @@ class Tracker:
         
         return True
         
-    def _get_current_offset(self) -> float:
+    def _get_current_offset(self, source: Source) -> float:
         """
         Get the difference between the current position and the target position in deg.
-        """
-        if self.target is None:
-            raise ValidationError("No target set")
+        
+        Args:
+            source: Source object with target coordinates
             
-        az_target, el_target = self.pointing.radec2azel(self.target, self.ant, datetime.now(timezone.utc), apply_corrections=True, apply_pointing_model=True)
+        Returns:
+            float: Offset in degrees
+        """
+        az_target, el_target = self.pointing.radec2azel(source, self.ant, datetime.now(timezone.utc), apply_corrections=True, apply_pointing_model=True)
+        
         az_current, el_current = self.mqtt.get_current_position()
         
         if az_current is None or el_current is None:

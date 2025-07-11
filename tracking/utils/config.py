@@ -42,7 +42,7 @@ class TelescopeConfig:
     slew_simulation_steps: int = 50 # number of steps in the slew simulation
     
     # Axis mode settle/poll
-    axis_mode_settle_timeout: float = 15.0 # seconds to wait for mode change
+    axis_mode_settle_timeout: float = 4.0 # seconds to wait for mode change
     axis_mode_poll_interval: float = 0.1 # seconds between polls
     
     # Progress updates

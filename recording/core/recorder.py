@@ -480,12 +480,18 @@ class Recorder:
         
         try:
             save_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # Get current FFT shift and accumulation length values
+            fftshift_p0, fftshift_p1 = self.get_fftshift()
+            acclen = self.get_acclen()
+            
+            # Create filename with FFT shift and accumulation length
             if batch_num is not None:
-                filename = os.path.join(self._save_dir, f'data_batch_{batch_num:04d}_{save_timestamp}.npy')
+                filename = os.path.join(self._save_dir, f'data_batch_{batch_num:04d}_{save_timestamp}_fft{fftshift_p0}_{fftshift_p1}_acc{acclen}.npy')
             elif suffix:
-                filename = os.path.join(self._save_dir, f'data_{save_timestamp}_{suffix}.npy')
+                filename = os.path.join(self._save_dir, f'data_{save_timestamp}_{suffix}_fft{fftshift_p0}_{fftshift_p1}_acc{acclen}.npy')
             else:
-                filename = os.path.join(self._save_dir, f'data_{save_timestamp}.npy')
+                filename = os.path.join(self._save_dir, f'data_{save_timestamp}_fft{fftshift_p0}_{fftshift_p1}_acc{acclen}.npy')
             
             np.save(filename, array)
             logger.info(f"Saved array of shape {array.shape} to {filename}")
