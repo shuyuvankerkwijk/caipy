@@ -11,6 +11,8 @@ class OperationType(Enum):
     SLEW = "slew"
     TRACK = "track"
     PARK = "park"
+    RASTA_SCAN = "rasta_scan"
+    POINTING_OFFSETS = "pointing_offsets"
 
 
 @dataclass

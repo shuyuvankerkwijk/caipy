@@ -27,18 +27,22 @@ from recording import Recorder, logger
 
 # Basic usage with context manager (continuous recording)
 with Recorder() as recorder:
-    recorder.start_recording(observation_name="continuous_run")  # Records until stopped
+    recorder.set_observation_name("continuous_run")
+    recorder.start_recording()  # Records until stopped
 
 # Timed recording
 with Recorder() as recorder:
-    recorder.start_recording(observation_name="test_run", duration_seconds=60)
+    recorder.set_observation_name("test_run")
+    recorder.start_recording(duration_seconds=60)
 
-# Advanced usage with custom parameters
+# Advanced usage with custom parameters and metadata
 recorder = Recorder()
 recorder.set_fftshift(1000)
 recorder.set_acclen(65536)
 recorder.set_waittime(0.1)
-recorder.start_recording(observation_name="calibration")  # Continuous recording
+recorder.set_observation_name("calibration")
+recorder.set_metadata({"experiment_type": "calibration", "operator": "user"})
+recorder.start_recording()  # Continuous recording
 ```
 
 ### Command Line Interface

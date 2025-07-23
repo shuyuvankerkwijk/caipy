@@ -19,7 +19,7 @@ class DeviceConfig:
     fpgfile: str = "/home/sprite/TEST_ARRAY/dsa-rfsoc-firmware/firmware/dsa_ta_rfsoc4x2/outputs/dsa_ta_rfsoc4x2_2025-05-21_1326.fpg"
     
     # FPGA settings
-    default_fftshift: int = 1170
+    default_fftshift: int = 1904
     default_acclen: int = 131072
     fftshift_min: int = 0
     fftshift_max: int = 4095

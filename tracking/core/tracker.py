@@ -70,7 +70,9 @@ class Tracker:
     def run_track(self, ant: str, source: Source, duration_hours: float, 
                   slew: bool = True, park: bool = True, 
                   progress_callback: Optional[ProgressCallback] = None,
-                  auto_cleanup: bool = True) -> bool:
+                  auto_cleanup: bool = True,
+                  on_track_start: Optional[Callable] = None,
+                  on_track_stop: Optional[Callable] = None) -> bool:
         """
         Run the tracker for one antenna, in ["N", "S"]. Handles slewing, tracking, and parking in sequence.
         
@@ -82,6 +84,8 @@ class Tracker:
             park: Whether to park after tracking (default: True)
             progress_callback: Optional ProgressCallback for detailed progress updates
             auto_cleanup: Whether to automatically cleanup and disconnect MQTT (default: True)
+            on_track_start: Optional callback to run when tracking begins
+            on_track_stop: Optional callback to run when tracking ends
             
         Returns:
             bool: True if successful, False otherwise
@@ -120,7 +124,7 @@ class Tracker:
                 )
                 progress_callback(progress_info)
             
-            if not self._track(source, duration_hours, progress_callback=progress_callback):
+            if not self._track(source, duration_hours, progress_callback=progress_callback, on_track_start=on_track_start, on_track_stop=on_track_stop):
                 raise OperationError("Tracking failed")
 
             # Park if requested
@@ -261,21 +265,21 @@ class Tracker:
             return False
         return True
 
-    def get_current_position(self) -> tuple:
-        """
-        Get the current telescope position.
+    # def get_current_position(self) -> tuple:
+    #     """
+    #     Get the current telescope position.
         
-        Returns:
-            tuple: (azimuth, elevation) in degrees, or (None, None) if not available
-        """
-        try:
-            if hasattr(self, 'mqtt') and self.mqtt is not None:
-                return self.mqtt.get_current_position()
-            else:
-                return (None, None)
-        except Exception as e:
-            logger.warning(f"Error getting current position: {e}")
-            return (None, None)
+    #     Returns:
+    #         tuple: (azimuth, elevation) in degrees, or (None, None) if not available
+    #     """
+    #     try:
+    #         if hasattr(self, 'mqtt') and self.mqtt is not None:
+    #             return self.mqtt.get_current_position()
+    #         else:
+    #             return (None, None)
+    #     except Exception as e:
+    #         logger.warning(f"Error getting current position: {e}")
+    #         return (None, None)
     
     def cleanup(self) -> None:
         """
@@ -322,7 +326,9 @@ class Tracker:
     def run_rasta_scan(self, ant: str, source: Source, max_distance_deg: float, steps_deg: float, position_angle_deg: float, duration_hours: float, 
                        slew: bool = True, park: bool = True,
                        progress_callback: Optional[ProgressCallback] = None,
-                       auto_cleanup: bool = True) -> bool:
+                       auto_cleanup: bool = True,
+                       on_track_start: Optional[Callable] = None,
+                       on_track_stop: Optional[Callable] = None) -> bool:
         """
         Run a Rasta scan. Returns True if successful, False otherwise.
         
@@ -337,6 +343,8 @@ class Tracker:
             park: Whether to park after scanning (default: True)
             progress_callback: Optional ProgressCallback for detailed progress updates
             auto_cleanup: Whether to automatically cleanup and disconnect MQTT (default: True)
+            on_track_start: Optional callback to run when tracking begins
+            on_track_stop: Optional callback to run when tracking ends
             
         Returns:
             bool: True if successful, False otherwise
@@ -402,7 +410,7 @@ class Tracker:
                     raise OperationError("Slewing to first position failed")
             
             # Track source at every offset
-            if not self._rasta_scan(sources, duration_hours, progress_callback):
+            if not self._track_multiple(sources, duration_hours, OperationType.RASTA_SCAN, progress_callback, on_track_start=on_track_start, on_track_stop=on_track_stop):
                 raise OperationError("Rasta scan failed")
 
             logger.info(f"{Colors.GREEN}Rasta scan completed successfully{Colors.RESET}")
@@ -428,7 +436,9 @@ class Tracker:
     def run_pointing_offsets(self, ant: str, source: Source, closest_distance_deg: float, number_of_points: int,
                              duration_hours: float, slew: bool = True, park: bool = True,
                              progress_callback: Optional[ProgressCallback] = None,
-                             auto_cleanup: bool = True) -> bool:
+                             auto_cleanup: bool = True,
+                             on_track_start: Optional[Callable] = None,
+                             on_track_stop: Optional[Callable] = None) -> bool:
         """Run a pointing-offset pattern (cross / triangle etc.) around *source*.
 
         This helper generates *number_of_points* offsets (5, 7, 9, 13 supported – see
@@ -486,7 +496,7 @@ class Tracker:
                     raise OperationError("Slewing to first position failed")
 
             # Track each offset using existing _rasta_scan helper
-            if not self._rasta_scan(sources, duration_hours, progress_callback):
+            if not self._track_multiple(sources, duration_hours, OperationType.POINTING_OFFSETS, progress_callback, on_track_start=on_track_start, on_track_stop=on_track_stop):
                 raise OperationError("Pointing-offset scan failed")
 
             logger.info(f"{Colors.GREEN}Pointing-offset scan completed successfully{Colors.RESET}")
@@ -585,13 +595,15 @@ class Tracker:
         if not validation_result.is_safe:
             raise SafetyError(f"Target validation failed: {validation_result.message}")
 
-    def _rasta_scan(self, sources: List[Source], duration_hours: float, progress_callback: Optional[ProgressCallback] = None) -> bool:
+    def _track_multiple(self, sources: List[Source], duration_hours: float, operation_type: OperationType, progress_callback: Optional[ProgressCallback] = None,
+                    on_track_start: Optional[Callable] = None, on_track_stop: Optional[Callable] = None) -> bool:
         """
         Track multiple sources for a given duration. Returns True if successful, False otherwise.
         
         Args:
             sources: List of Source objects to track
             duration_hours: Duration to track each source in hours
+            operation_type: OperationType for the progress info
             progress_callback: Optional ProgressCallback for detailed progress updates
             
         Returns:
@@ -640,12 +652,27 @@ class Tracker:
         sst = ds + timedelta(seconds=3) + timedelta(seconds=1.173)
         self.mqtt.send_track_start_time(d2m(sst))
 
+        # Trigger on_track_start callback if provided (for overall scan start)
+        if on_track_start:
+            logger.info(f"{Colors.BLUE}Calling on_track_start() for overall scan start{Colors.RESET}")
+            on_track_start()
+        else:
+            logger.warning(f"{Colors.RED}on_track_start callback is None{Colors.RESET}")
+
         logger.info(f"{Colors.BLUE}Starting tracking loop for {num_points} points ({duration_hours:.4f} hours){Colors.RESET}")
         
         total_sources = len(sources)
         rt_offset = 0  # Track cumulative time across all sources
 
         for source_idx, source in enumerate(sources):
+            # Trigger on_track_start callback for this specific source/point
+            if on_track_start:
+                # Pass source info to the callback for file naming
+                logger.info(f"{Colors.BLUE}Calling on_track_start(source, {source_idx}) for point start{Colors.RESET}")
+                on_track_start(source, source_idx)
+            else:
+                logger.warning(f"{Colors.RED}on_track_start callback is None for point {source_idx}{Colors.RESET}")
+            
             for i in range(num_points):
                 # Check if motion stop requested
                 if self.state == State.STOP:
@@ -669,7 +696,7 @@ class Tracker:
                 
                 if progress_callback and (i + 1) % 1 == 0:  # Update every 1 points (0.5 seconds)
                     progress_info = ProgressInfo(
-                        operation_type=OperationType.TRACK,
+                        operation_type=operation_type,
                         antenna=self.ant,
                         percent_complete=percent,
                         message=f"Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s"
@@ -680,16 +707,30 @@ class Tracker:
                 if (i + 1) % 1 == 0:
                     logger.info(f"{Colors.BLUE}Track progress: Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
 
-                        # Update rt_offset for next source
+            # Trigger on_track_stop callback for this specific source/point
+            if on_track_stop:
+                logger.info(f"{Colors.BLUE}Calling on_track_stop(source, {source_idx}) for point stop{Colors.RESET}")
+                on_track_stop(source, source_idx)
+            else:
+                logger.warning(f"{Colors.RED}on_track_stop callback is None for point {source_idx}{Colors.RESET}")
+            
+            # Update rt_offset for next source
             rt_offset += num_points * 0.5
             
             # Log completion of this source
             logger.info(f"{Colors.GREEN}Completed tracking source {source_idx+1}/{total_sources}: {num_points} points processed{Colors.RESET}")
         
+        # Trigger on_track_stop callback if provided (for overall scan end)
+        if on_track_stop:
+            logger.info(f"{Colors.BLUE}Calling on_track_stop() for overall scan stop{Colors.RESET}")
+            on_track_stop()
+        else:
+            logger.warning(f"{Colors.RED}on_track_stop callback is None for overall scan stop{Colors.RESET}")
+
         # Send completion progress
         if progress_callback:
             progress_info = ProgressInfo(
-                operation_type=OperationType.TRACK,
+                operation_type=operation_type,
                 antenna=self.ant,
                 percent_complete=100.0,
                 message="Rasta scan completed",
@@ -704,7 +745,9 @@ class Tracker:
         return True
 
     def _track(self, source: Source, duration_hours: float, 
-               progress_callback: Optional[ProgressCallback] = None) -> bool:
+               progress_callback: Optional[ProgressCallback] = None,
+               on_track_start: Optional[Callable] = None,
+               on_track_stop: Optional[Callable] = None) -> bool:
         """
         Track a source for a given duration. Returns True if successful, False otherwise.
         """
@@ -742,6 +785,10 @@ class Tracker:
         ds = d0 - timedelta(seconds=d0s) # get most recent 0.0 or 0.5 second boundary
         sst = ds + timedelta(seconds=2.5) + timedelta(seconds=0.5) + timedelta(seconds=1.173) # add 3 seconds and 1.173 seconds to get scheduled start time
         self.mqtt.send_track_start_time(d2m(sst))
+
+        # Trigger on_track_start callback if provided
+        if on_track_start:
+            on_track_start()
 
         # Track source
         logger.info(f"{Colors.BLUE}Starting tracking loop for {num_points} points ({duration_hours:.4f} hours){Colors.RESET}")
@@ -790,6 +837,10 @@ class Tracker:
             # Log progress every 10 points (5 seconds)
             if (i + 1) % 10 == 0:
                 logger.info(f"{Colors.BLUE}Track progress: Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
+
+        # Trigger on_track_stop callback if provided
+        if on_track_stop:
+            on_track_stop()
 
         # Log final progress
         logger.info(f"{Colors.GREEN}Track completed: {num_points} points processed{Colors.RESET}")

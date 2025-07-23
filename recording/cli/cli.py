@@ -122,16 +122,18 @@ Examples:
         logger.info(f"  Wait Time: {recorder.get_waittime()} seconds")
         logger.info("")
         
+        # Set observation name if provided
+        if args.name:
+            recorder.set_observation_name(args.name)
+            logger.info(f"Observation name set to: {args.name}")
+        
         # Start recording
         if args.duration:
             logger.info(f"Starting recording for {args.duration} seconds...")
         else:
             logger.info("Starting continuous recording (will create new files every 2000 lines, press Ctrl+C to stop)...")
         
-        success = recorder.start_recording(
-            observation_name=args.name,
-            duration_seconds=args.duration
-        )
+        success = recorder.start_recording(duration_seconds=args.duration)
         
         if success:
             logger.info(f"{Colors.GREEN}Recording completed successfully{Colors.RESET}")

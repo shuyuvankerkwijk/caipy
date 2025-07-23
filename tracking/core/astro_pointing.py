@@ -16,7 +16,7 @@ from tracking.utils.colors import Colors
 logger = logging.getLogger(__name__)
 
 class AstroPointing:
-    def __init__(self, location : Optional[EarthLocation] = None, temp_C : Optional[float] = None, pressure : Optional[float] = None, rh : Optional[float] = None, n_ppar : Optional[list[float]] = None, s_ppar : Optional[list[float]] = None):
+    def __init__(self, location_n : Optional[EarthLocation] = None, location_s : Optional[EarthLocation] = None, temp_C : Optional[float] = None, pressure : Optional[float] = None, rh : Optional[float] = None, n_ppar : Optional[list[float]] = None, s_ppar : Optional[list[float]] = None):
         """
         Pointing model object for a given antenna and source location.
 
@@ -29,20 +29,19 @@ class AstroPointing:
             n_ppar (list): North pointing model parameters
             s_ppar (list): South pointing model parameters
         """
-
-        self.location = location or config.telescope.location
         self.temp_C = temp_C or config.telescope.temperature_C
         self.pressure = pressure or config.telescope.pressure_mb
         self.rh = rh or config.telescope.relative_humidity
+
+        # Location
+        self.location_n = location_n or config.telescope.location_n
+        self.location_s = location_s or config.telescope.location_s
 
         # Pointing model
         self.n_ppar = n_ppar or config.telescope.n_ppar
         self.s_ppar = s_ppar or config.telescope.s_ppar
 
     def radec2azel(self, source : Source, ant : str, obs_datetime : datetime = None, apply_corrections : bool = True, apply_pointing_model : bool = True, clip : bool = True) -> tuple[float, float]:
-        # Validate antenna parameter
-        if ant not in ["N", "S"]:
-            raise ValueError(f"Invalid antenna: {ant}. Must be 'N' or 'S'")
         """
         Calculate star position in horizontal coordinates using Astropy.
         
@@ -61,6 +60,13 @@ class AstroPointing:
         Returns:
             tuple: (azimuth_deg, elevation_deg)
         """
+        # Select per-antenna location
+        if ant == "N":
+            obs_location = self.location_n
+        elif ant == "S":
+            obs_location = self.location_s
+        else:
+            raise ValueError(f"Invalid antenna: {ant}")
 
         # Ensure obs_datetime is timezone-aware and in UTC
         if obs_datetime.tzinfo is None or obs_datetime.tzinfo.utcoffset(obs_datetime) is None:
@@ -82,7 +88,7 @@ class AstroPointing:
 
         # Calculate alt/az
         altaz = coord.transform_to(AltAz(
-            location=self.location,
+            location=obs_location,
             obstime=obs_time,
             pressure=self.pressure * u.mbar,
             temperature=self.temp_C * u.deg_C
@@ -139,7 +145,7 @@ class AstroPointing:
         Returns:
             tuple: (mount_az, mount_el) - Mount coordinates in degrees
         """ 
-
+        # Select per-antenna pointing model
         if ant == "N":
             ppar = self.n_ppar
         elif ant == "S":

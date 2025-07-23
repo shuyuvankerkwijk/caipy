@@ -35,7 +35,7 @@ class SafetyChecker:
             location: Observatory location
             safety_radius_deg: Minimum safe angular distance from sun (uses config if None)
         """
-        self.location = location or config.telescope.location
+        self.location = location or config.telescope.location_m
         self.safety_radius_deg = safety_radius_deg or config.telescope.sun_safety_radius
     
     def check_position_safety(self, ra_hrs: float, dec_deg: float, 

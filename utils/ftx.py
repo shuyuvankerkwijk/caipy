@@ -351,38 +351,3 @@ def set_ftx_lna_enabled(polarization: int, enabled: bool,
     """
     controller = FTXController(antenna, base_url)
     return controller.set_lna_enabled(polarization, enabled)
-
-
-if __name__ == "__main__":
-    # Example usage
-    import sys
-    
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
-    
-    # Test both antennas
-    for antenna_name, antenna_enum in [("North", Antenna.NORTH), ("South", Antenna.SOUTH)]:
-        print(f"\n=== Testing {antenna_name} Antenna ===")
-        
-        # Create controller for this antenna
-        controller = FTXController(antenna_enum)
-        
-        # Test connection
-        if not controller.test_connection():
-            print(f"Failed to connect to {antenna_name} FTX system")
-            continue
-        
-        print(f"{antenna_name} FTX connection successful!")
-        
-        # Get monitor data for both polarizations
-        for pol in [0, 1]:
-            try:
-                data = controller.get_monitor_data(pol)
-                print(f"\nPolarization {pol} monitor data:")
-                print(f"  Temperature: {data.temperature_c:.2f}°C")
-                print(f"  Attenuation: {data.attenuation_db:.2f} dB")
-                print(f"  RF Power: {data.rf_power_dbm:.2f} dBm")
-                print(f"  Laser Current: {data.ld_current_ma:.2f} mA")
-                print(f"  LNA Current: {data.lna_current_ma:.2f} mA")
-            except Exception as e:
-                print(f"Error getting data for polarization {pol}: {e}") 

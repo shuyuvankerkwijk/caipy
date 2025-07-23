@@ -55,14 +55,46 @@ def get_targets_offsets(amp_offsets_deg: float, num_offsets: int, ra_hrs: float,
     elif num_offsets == 13:
         ra_hrs_list = [center_coord.ra.hour]
         dec_deg_list = [center_coord.dec.deg]
-        for angle in [0, 90, 180, 270]:
-            offset_coord = center_coord.directional_offset_by(position_angle=angle * u.deg, separation=amp_offsets_deg * u.deg)
+        
+        # Create concentric triangular patterns for optimal 2D Gaussian fitting
+        # Pattern: center + 4 rings of 3 points each at increasing distances
+        
+        # Ring 1: 3 points at 1×amp_offsets_deg, angles 0°, 120°, 240°
+        for angle in [0, 120, 240]:
+            offset_coord = center_coord.directional_offset_by(
+                position_angle=angle * u.deg, 
+                separation=amp_offsets_deg * u.deg
+            )
             ra_hrs_list.append(offset_coord.ra.hour)
             dec_deg_list.append(offset_coord.dec.deg)
-        for angle in range(0, 360, 45):
-            offset_coord = center_coord.directional_offset_by(position_angle=angle * u.deg, separation=2 * amp_offsets_deg * u.deg)
+        
+        # Ring 2: 3 points at 2×amp_offsets_deg, angles 60°, 180°, 300° (rotated 60° from ring 1)
+        for angle in [60, 180, 300]:
+            offset_coord = center_coord.directional_offset_by(
+                position_angle=angle * u.deg, 
+                separation=2 * amp_offsets_deg * u.deg
+            )
             ra_hrs_list.append(offset_coord.ra.hour)
             dec_deg_list.append(offset_coord.dec.deg)
+        
+        # Ring 3: 3 points at 3×amp_offsets_deg, angles 0°, 120°, 240° (aligned with ring 1)
+        for angle in [0, 120, 240]:
+            offset_coord = center_coord.directional_offset_by(
+                position_angle=angle * u.deg, 
+                separation=3 * amp_offsets_deg * u.deg
+            )
+            ra_hrs_list.append(offset_coord.ra.hour)
+            dec_deg_list.append(offset_coord.dec.deg)
+        
+        # Ring 4: 3 points at 4×amp_offsets_deg, angles 60°, 180°, 300° (rotated 60° from ring 3)
+        for angle in [60, 180, 300]:
+            offset_coord = center_coord.directional_offset_by(
+                position_angle=angle * u.deg, 
+                separation=4 * amp_offsets_deg * u.deg
+            )
+            ra_hrs_list.append(offset_coord.ra.hour)
+            dec_deg_list.append(offset_coord.dec.deg)
+        
         return ra_hrs_list, dec_deg_list
 
     else:

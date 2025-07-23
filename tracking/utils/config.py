@@ -13,11 +13,21 @@ from astropy.coordinates import EarthLocation
 @dataclass
 class TelescopeConfig:
     """Telescope configuration parameters."""
-    # Location (OVRO)
-    latitude: float = 37.23335 # degrees
-    longitude: float = -118.28065 # degrees
-    height: float = 1222.0 # meters
-    location: EarthLocation = None
+    # Legacy single-location (midpoint)
+    lat_m: float = 37.23335
+    lon_m: float = -118.28065
+    height_m: float = 1222.0
+    location_m: EarthLocation = None
+
+    # Per-antenna geodetic coordinates (updated values)
+    lat_n: float = 37.23347717  # degrees
+    lon_n: float = -118.2805309 # degrees
+    lat_s: float = 37.23330959  # degrees
+    lon_s: float = -118.2805311 # degrees
+    height_n: float = 0.0       # metres (antenna pad height)
+    height_s: float = 0.0       # metres
+    location_n: EarthLocation = None  # North antenna
+    location_s: EarthLocation = None  # South antenna
     
     # Limits
     elevation_min: float = 11.0 # degrees
@@ -62,19 +72,30 @@ class TelescopeConfig:
     
     # Pointing model
     #                  flex sin, flex cos, az tilt ha, az tilt lat, el tilt, collim x, collim y, az zero, el zero, az sin, az cos
-    #n_ppar = [0.047662, -0.019278, 0.420949, 0.216930, -0.023133, 0.000000, 0.000000, -0.031568, 0.000000, 0.011365, -0.008912]
-    #s_ppar = [0.000000, -0.076122, 0.054547, -0.044196, 0.005655, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
-    n_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
-    s_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
+    n_ppar = [0.047662, -0.019278, 0.420949, 0.216930, -0.023133, 0.000000, 0.000000, -0.031568, 0.000000, 0.011365, -0.008912]
+    s_ppar = [0.000000, -0.076122, 0.054547, -0.044196, 0.005655, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
+    #n_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
+    #s_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
 
     sto: float = 1.173   # seconds
     delay: float = 3.0   # seconds
 
     def __post_init__(self):
-        if self.location is None:
-            self.location = EarthLocation(lat=self.latitude * u.deg, 
-                                        lon=self.longitude * u.deg, 
-                                        height=self.height * u.m)
+        # Per-antenna locations
+        if self.location_m is None:
+            self.location_m = EarthLocation(lat=self.lat_m * u.deg,
+                                            lon=self.lon_m * u.deg,
+                                            height=self.height_m * u.m)
+
+        if self.location_n is None:
+            self.location_n = EarthLocation(lat=self.lat_n * u.deg,
+                                            lon=self.lon_n * u.deg,
+                                            height=self.height_n * u.m)
+
+        if self.location_s is None:
+            self.location_s = EarthLocation(lat=self.lat_s * u.deg,
+                                            lon=self.lon_s * u.deg,
+                                            height=self.height_s * u.m)
         
         if self.safe_elevation_candidates is None:
             self.safe_elevation_candidates = [15, 13, 20, 18, 25, 30, 35, 40, 45, 50]
@@ -87,7 +108,7 @@ class MQTTConfig:
     north_broker_ip: str = "192.168.65.60" #"000.000.00.00"
     south_broker_ip: str = "192.168.65.50" #"000.000.00.01"
     port: int = 1883
-    client_id: str = "spmac"
+    client_id: str = "spmac"  # Base client ID - will be made unique at runtime
     connection_timeout: int = 60
     connection_wait_timeout: float = 10.0
     
@@ -108,8 +129,8 @@ class MQTTConfig:
     destination_el: str = "Motion.MotionAxis.Elevation"
     destination_prg_trk: str = "Setpoints.ProgramTrack.PrgTr1"
     
-    # Timeouts and intervals
-    read_timeout: float = 1.0
+    # Timeouts and intervals - increased for better reliability
+    read_timeout: float = 3.0  # Increased from 1.0 to 3.0 seconds
     poll_sleep_interval: float = 0.01
     track_sleep_interval: float = 0.0001
     

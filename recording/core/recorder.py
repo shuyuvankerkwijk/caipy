@@ -7,7 +7,7 @@ import dsa_rfsoc4x2
 import numpy as np
 import datetime
 import time
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Dict
 from ..utils.config import config
 from ..utils.exceptions import (
     DeviceConnectionError, DeviceInitializationError, DataCollectionError,
@@ -16,6 +16,16 @@ from ..utils.exceptions import (
 from ..utils.colors import Colors
 from recording.utils.progress import ProgressCallback
 import threading
+
+# Import MQTT for antenna position reading
+try:
+    import paho.mqtt.client as mqtt
+    from tracking.utils.config import config as tracking_config
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
+    mqtt = None
+    tracking_config = None
 
 # Get logger for this module
 import logging
@@ -27,7 +37,16 @@ class Recorder:
     A recorder for collecting data from the DSA RFSoC4x2 device.
     
     This class provides a clean interface for configuring and recording data
-    from the FPGA-based data acquisition system.
+    from the FPGA-based data acquisition system. It automatically tracks 
+    antenna positions by subscribing to MQTT topics, saving az/el positions 
+    every 10 lines (one time integration) to a 'positions.csv' file.
+    
+    Position tracking works by:
+    - Automatically connecting to MQTT brokers for both antennas 
+    - Subscribing to position status topics
+    - Recording real positions if antennas are available
+    - Recording NaN values if antennas are not available (shown as empty cells)
+    - Creating positions.csv with columns: timestamp, north_az_deg, north_el_deg, south_az_deg, south_el_deg
     """
     
     def __init__(self):
@@ -43,11 +62,41 @@ class Recorder:
         self._data_buffer = []
         self._buffer_lock = threading.Lock()
         
+        # External metadata and filename control
+        self._external_metadata: Dict[str, Any] = {}
+        self._observation_name: Optional[str] = None
+        
+        # Point recording state
+        self._current_line_position = 0
+        self._point_start_lines: Dict[int, int] = {}
+        
+        # Position tracking components
+        self._positions_buffer = []
+        self._positions_lock = threading.Lock()
+        self._position_tracking_enabled = MQTT_AVAILABLE
+        
+        # Simple MQTT clients for position reading
+        self._mqtt_clients: Dict[str, Optional[mqtt.Client]] = {'N': None, 'S': None}
+        self._current_positions: Dict[str, Dict[str, Optional[float]]] = {
+            'N': {'az': None, 'el': None},
+            'S': {'az': None, 'el': None}
+        }
+        self._position_lock = threading.Lock()
+        
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
         
         # Initialize device connection
         self._initialize_device()
+        
+        # Automatically enable position tracking if available
+        if self._position_tracking_enabled:
+            try:
+                self.enable_position_tracking('both')
+                logger.info("Automatically enabled position tracking for both antennas")
+            except Exception as e:
+                logger.info(f"Could not automatically enable position tracking: {e}")
+                logger.info("Position tracking will record NaN values")
 
     # ============================================================================
     # PUBLIC PROPERTIES
@@ -62,6 +111,244 @@ class Recorder:
     def save_directory(self) -> Optional[str]:
         """Get the current save directory."""
         return self._save_dir
+    
+    def get_current_save_dir(self) -> Optional[str]:
+        """Get the current save directory for debugging."""
+        logger.info(f"Current save directory: {self._save_dir}")
+        return self._save_dir
+
+    # ============================================================================
+    # EXTERNAL INTERFACE METHODS
+    # ============================================================================
+    
+    def set_observation_name(self, name: str) -> None:
+        """Set the observation name for the next recording session."""
+        self._observation_name = name
+        logger.info(f"Observation name set to: {name}")
+
+    def set_metadata(self, metadata: Dict[str, Any]) -> None:
+        """Set external metadata to be included in the recording session."""
+        self._external_metadata = metadata.copy()
+        logger.info(f"External metadata set: {len(metadata)} items")
+
+    def clear_metadata(self) -> None:
+        """Clear all external metadata."""
+        self._external_metadata.clear()
+        logger.info("External metadata cleared")
+
+    # ============================================================================
+    # ANTENNA POSITION TRACKING METHODS
+    # ============================================================================
+    
+    def enable_position_tracking(self, antennas: str = 'both') -> None:
+        """
+        Enable antenna position tracking by subscribing to MQTT topics.
+        
+        Args:
+            antennas: Which antennas to track ("N", "S", or "both")
+        """
+        if not self._position_tracking_enabled:
+            logger.warning("Position tracking not available - MQTT module not found")
+            return
+            
+        if antennas in ['N', 'S']:
+            antenna_list = [antennas]
+        elif antennas == 'both':
+            antenna_list = ['N', 'S']
+        else:
+            raise InvalidParameterError(f"Invalid antenna identifier: {antennas}. Must be 'N', 'S', or 'both'")
+        
+        for ant in antenna_list:
+            if self._mqtt_clients[ant] is None:
+                self._setup_mqtt_client(ant)
+
+    def _setup_mqtt_client(self, ant: str) -> None:
+        """Set up a simple MQTT client to read antenna positions."""
+        try:
+            # Get broker IP based on antenna
+            if ant == "N":
+                broker_ip = tracking_config.mqtt.north_broker_ip
+            elif ant == "S":
+                broker_ip = tracking_config.mqtt.south_broker_ip
+            else:
+                raise ValueError(f"Invalid antenna: {ant}")
+            
+            # Create MQTT client
+            client_id = f"recorder_position_{ant}_{int(time.time())}"
+            client = mqtt.Client(client_id=client_id)
+            
+            # Set up callbacks
+            def on_connect(client, userdata, flags, rc):
+                if rc == 0:
+                    logger.info(f"Connected to MQTT broker for antenna {ant}")
+                    # Subscribe to position topics
+                    az_topic = tracking_config.mqtt.topic_az_status.format(ant=ant) if '{ant}' in tracking_config.mqtt.topic_az_status else tracking_config.mqtt.topic_az_status
+                    el_topic = tracking_config.mqtt.topic_el_status.format(ant=ant) if '{ant}' in tracking_config.mqtt.topic_el_status else tracking_config.mqtt.topic_el_status
+                    client.subscribe(az_topic)
+                    client.subscribe(el_topic)
+                else:
+                    logger.error(f"Failed to connect to MQTT broker for antenna {ant}: {rc}")
+            
+            def on_message(client, userdata, msg):
+                self._handle_position_message(ant, msg.topic, msg.payload.decode())
+            
+            client.on_connect = on_connect
+            client.on_message = on_message
+            
+            # Connect to broker
+            client.connect(broker_ip, tracking_config.mqtt.port, 60)
+            client.loop_start()
+            
+            self._mqtt_clients[ant] = client
+            logger.info(f"Set up position tracking for antenna {ant}")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup MQTT client for antenna {ant}: {e}")
+            self._mqtt_clients[ant] = None
+
+    def _handle_position_message(self, ant: str, topic: str, payload: str) -> None:
+        """Handle incoming MQTT position messages."""
+        try:
+            import json
+            data = json.loads(payload)
+            
+            if 'v' in data and 'act_pos' in data['v']:
+                position = float(data['v']['act_pos'])
+                
+                with self._position_lock:
+                    if 'az' in topic.lower():
+                        self._current_positions[ant]['az'] = position
+                    elif 'el' in topic.lower():
+                        self._current_positions[ant]['el'] = position
+                        
+        except Exception as e:
+            logger.debug(f"Error parsing position message for {ant}: {e}")
+
+    def get_current_antenna_positions(self) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """
+        Get current positions for all antennas.
+        
+        Returns:
+            Dict mapping antenna ID to (az, el) tuple, or (None, None) if unavailable
+        """
+        positions = {}
+        
+        with self._position_lock:
+            for ant in ['N', 'S']:
+                az = self._current_positions[ant]['az']
+                el = self._current_positions[ant]['el']
+                positions[ant] = (az, el)
+        
+        return positions
+
+    def _record_antenna_positions(self) -> None:
+        """Record current antenna positions to the buffer."""
+        if not self._position_tracking_enabled:
+            return
+            
+        current_time = time.time()
+        positions = self.get_current_antenna_positions()
+        
+        # Create position record: [timestamp, N_az, N_el, S_az, S_el]
+        position_record = [
+            current_time,
+            positions['N'][0] if positions['N'][0] is not None else np.nan,
+            positions['N'][1] if positions['N'][1] is not None else np.nan,
+            positions['S'][0] if positions['S'][0] is not None else np.nan,
+            positions['S'][1] if positions['S'][1] is not None else np.nan
+        ]
+        
+        with self._positions_lock:
+            self._positions_buffer.append(position_record)
+        
+        # Log positions occasionally (every 10th record to avoid spam)
+        if len(self._positions_buffer) % 10 == 1:
+            n_az_str = f"{positions['N'][0]:.2f}" if positions['N'][0] is not None else 'N/A'
+            n_el_str = f"{positions['N'][1]:.2f}" if positions['N'][1] is not None else 'N/A'
+            s_az_str = f"{positions['S'][0]:.2f}" if positions['S'][0] is not None else 'N/A'
+            s_el_str = f"{positions['S'][1]:.2f}" if positions['S'][1] is not None else 'N/A'
+            
+            logger.info(f"Recorded positions - N: ({n_az_str}, {n_el_str}), S: ({s_az_str}, {s_el_str})")
+
+    def _save_positions_file(self) -> None:
+        """Save the positions buffer to 'positions.csv' file."""
+        if not self._position_tracking_enabled or self._save_dir is None:
+            return
+            
+        with self._positions_lock:
+            if not self._positions_buffer:
+                logger.debug("No positions to save")
+                return
+                
+            # Save to CSV file
+            try:
+                positions_file = os.path.join(self._save_dir, 'positions.csv')
+                
+                # Write CSV file with headers
+                with open(positions_file, 'w', newline='') as csvfile:
+                    import csv
+                    writer = csv.writer(csvfile)
+                    
+                    # Write header
+                    writer.writerow(['timestamp', 'north_az_deg', 'north_el_deg', 'south_az_deg', 'south_el_deg'])
+                    
+                    # Write data rows
+                    for record in self._positions_buffer:
+                        # Format the row, replacing NaN with empty string for readability
+                        formatted_record = []
+                        for i, value in enumerate(record):
+                            if i == 0:  # timestamp
+                                formatted_record.append(f"{value:.6f}")
+                            elif np.isnan(value):
+                                formatted_record.append("")  # Empty for NaN values
+                            else:
+                                formatted_record.append(f"{value:.6f}")
+                        writer.writerow(formatted_record)
+                
+                logger.info(f"Saved {len(self._positions_buffer)} position records to {positions_file}")
+                if self._current_line_position > 0:
+                    ratio = self._current_line_position / len(self._positions_buffer)
+                    logger.info(f"Data lines: {self._current_line_position}, Position records: {len(self._positions_buffer)}, Ratio: {ratio:.1f} (expected: ~10.0)")
+                else:
+                    logger.info(f"Position records: {len(self._positions_buffer)}")
+            except Exception as e:
+                logger.error(f"Failed to save positions file: {e}")
+
+    def clear_positions_buffer(self) -> None:
+        """Clear the positions buffer."""
+        with self._positions_lock:
+            self._positions_buffer.clear()
+        logger.info("Positions buffer cleared")
+
+    def is_position_tracking_enabled(self) -> bool:
+        """Check if position tracking is enabled and available."""
+        return self._position_tracking_enabled
+
+    def get_position_tracking_status(self) -> Dict[str, Any]:
+        """Get detailed status of position tracking system."""
+        status = {
+            'tracking_available': self._position_tracking_enabled,
+            'mqtt_clients': {},
+            'buffer_size': len(self._positions_buffer) if self._position_tracking_enabled else 0,
+            'current_positions': {}
+        }
+        
+        if self._position_tracking_enabled:
+            for ant in ['N', 'S']:
+                client = self._mqtt_clients[ant]
+                status['mqtt_clients'][ant] = {
+                    'configured': client is not None,
+                    'connected': client.is_connected() if client is not None else False
+                }
+                
+                # Include current position data
+                with self._position_lock:
+                    status['current_positions'][ant] = {
+                        'az': self._current_positions[ant]['az'],
+                        'el': self._current_positions[ant]['el']
+                    }
+        
+        return status
 
     # ============================================================================
     # DEVICE CONTROL METHODS
@@ -140,18 +427,14 @@ class Recorder:
     
     def start_recording(
         self,
-        observation_name: Optional[str] = None,
         duration_seconds: Optional[int] = None,
-        new: bool = True,
         progress_callback: Optional["ProgressCallback"] = None,
     ) -> bool:
         """
         Start recording data.
         
         Args:
-            observation_name: Optional name for the observation directory
             duration_seconds: Optional duration limit in seconds (None for continuous recording)
-            new: Whether to create a new directory (True) or use existing (False)
             progress_callback: Optional callback to report progress
         
         Returns:
@@ -165,14 +448,23 @@ class Recorder:
         if self._is_recording:
             raise StateError("Already recording. Stop current recording first.")
         
-        # Setup save directory
-        self._setup_save_directory(observation_name, new)
+        # Setup save directory using external observation name
+        self._setup_save_directory()
+
+        # Save metadata file with run and recorder settings
+        self._save_metadata_file(duration_seconds)
         
         # Initialize recording state
         self._initialize_recording_state()
         
         # Clear the plotting buffer when starting new recording
         self.clear_data_buffer()
+        
+        # Clear any previous point recording state
+        self._point_start_lines.clear()
+        
+        # Clear positions buffer when starting new recording
+        self.clear_positions_buffer()
 
         # Start the recording loop
         return self._recording_loop(duration_seconds, progress_callback)
@@ -186,6 +478,68 @@ class Recorder:
         self._is_recording = False
         self._interrupted = True
         logger.info(f"{Colors.RED}Recording stopped{Colors.RESET}")
+
+    # ============================================================================
+    # POINT RECORDING METHODS
+    # ============================================================================
+    
+    def start_point_recording(self, source_idx: int) -> None:
+        """
+        Called when a point starts to record the current line position.
+        
+        Args:
+            source_idx: The index of the scan point
+        """
+        if not self.is_recording:
+            logger.warning("Cannot start point recording: recording is not active.")
+            return
+        
+        # Only set start line if not already set (to avoid overwriting)
+        if source_idx not in self._point_start_lines:
+            self._point_start_lines[source_idx] = self._current_line_position
+            logger.info(f"Started tracking point {source_idx} at line {self._current_line_position}")
+        else:
+            logger.info(f"Point {source_idx} already has start line set to {self._point_start_lines[source_idx]}")
+
+    def log_point_to_file(self, source_ra: float, source_dec: float, source_idx: int, antenna: str = None) -> None:
+        """
+        Log the completion of a scan point to point_ranges.txt.
+        
+        Args:
+            source_ra: Right Ascension of the scan point
+            source_dec: Declination of the scan point  
+            source_idx: The index of the scan point
+            antenna: Antenna identifier ("N" or "S")
+        """
+        if not self.is_recording or not self._save_dir:
+            logger.warning("Cannot log point completion: recording is not active or save directory is not set.")
+            return
+
+        log_file_path = os.path.join(self._save_dir, "point_ranges.txt")
+        
+        try:
+            current_time = time.time()
+            start_line = self._point_start_lines.get(source_idx, 0)
+            end_line = self._current_line_position - 1  # Last line written (inclusive end)
+            
+            log_line = (
+                f"p{source_idx}{antenna}, "
+                f"ra {source_ra:.6f}, dec {source_dec:.6f}, "
+                f"timestamp {current_time:.6f}, lines {start_line}-{end_line}\n"
+            )
+            
+            with open(log_file_path, "a") as f:
+                f.write(log_line)
+                
+            logger.info(f"Logged point {source_idx}{antenna} to {log_file_path} (lines {start_line}-{end_line})")
+            
+            # Set the start line for the next point to ensure sequential ranges
+            next_source_idx = source_idx + 1
+            self._point_start_lines[next_source_idx] = self._current_line_position
+            logger.info(f"Set start line for next point {next_source_idx} to {self._current_line_position}")
+            
+        except Exception as e:
+            logger.error(f"Failed to log point completion to {log_file_path}: {e}")
 
     def is_recording_active(self) -> bool:
         """Check if recording is currently active (for external monitoring)."""
@@ -248,6 +602,9 @@ class Recorder:
         # Clear data buffer
         self.clear_data_buffer()
         
+        # Save any remaining positions and close MQTT clients
+        self._cleanup_position_tracking()
+        
         # Close device connection
         self._close_device_connection()
         
@@ -285,25 +642,66 @@ class Recorder:
         except Exception as e:
             raise DeviceInitializationError(f"Failed to initialize device parameters: {e}")
 
-    def _setup_save_directory(self, observation_name: Optional[str], new: bool) -> None:
+    def _setup_save_directory(self) -> None:
         """Setup the save directory for recording."""
-        if new:
-            try:
-                base_dir = str(config.recording.base_directory)
-                run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                if observation_name:
-                    save_dir = os.path.join(base_dir, f'{observation_name}_{run_timestamp}')
-                else:
-                    save_dir = os.path.join(base_dir, f'run_{run_timestamp}')
-                os.makedirs(save_dir, exist_ok=True)
-                self._save_dir = save_dir
-            except Exception as e:
-                raise DirectoryError(f"Failed to create save directory: {e}")
-        else:
-            if not self._save_dir:
-                raise StateError("No save directory specified. Set new=False only when a directory is already set.")
+        try:
+            base_dir = str(config.recording.base_directory)
+            run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # Use external observation name if set, otherwise use default
+            if self._observation_name:
+                save_dir = os.path.join(base_dir, f'{self._observation_name}_{run_timestamp}')
+            else:
+                save_dir = os.path.join(base_dir, f'observation_{run_timestamp}')
+            
+            os.makedirs(save_dir, exist_ok=True)
+            self._save_dir = save_dir
+            logger.info(f"Created new save directory: {self._save_dir}")
+        except Exception as e:
+            raise DirectoryError(f"Failed to create save directory: {e}")
 
         logger.info(f"Saving to: {self._save_dir}")
+
+    def _save_metadata_file(self, duration_seconds: Optional[int]) -> None:
+        """Save metadata file with run and recorder settings."""
+        try:
+            # Auto-set observation name from metadata if not already set
+            if not self._observation_name and self._external_metadata:
+                # Try to create a meaningful observation name from metadata
+                mode = self._external_metadata.get('mode', 'unknown')
+                antenna = self._external_metadata.get('antenna', 'unknown')
+                if antenna == 'both':
+                    antenna = 'NS'
+                elif antenna in ['N', 'S']:
+                    antenna = antenna
+                else:
+                    antenna = 'unknown'
+                
+                # Create observation name from mode and antenna
+                self._observation_name = f"{mode}_{antenna}"
+                logger.info(f"Auto-set observation name to: {self._observation_name}")
+            
+            meta = {
+                "observation_name": self._observation_name,
+                "start_time": datetime.datetime.now().isoformat(),
+                "duration_seconds": duration_seconds,
+                "fftshift": self.get_fftshift(),
+                "acclen": self.get_acclen(),
+                "waittime": self.get_waittime(),
+                "save_dir": self._save_dir,
+            }
+            
+            # Add external metadata
+            if self._external_metadata:
+                meta.update(self._external_metadata)
+            
+            with open(os.path.join(self._save_dir, "run_settings.txt"), "w") as f:
+                for k, v in meta.items():
+                    f.write(f"{k}: {v}\n")
+                    
+            logger.info(f"Saved metadata file with {len(meta)} items")
+        except Exception as e:
+            logger.warning(f"Could not write run_settings.txt: {e}")
 
     def _initialize_recording_state(self) -> None:
         """Initialize the recording state variables."""
@@ -325,6 +723,9 @@ class Recorder:
         idx = 0
         batch_num = 1
         start_time = time.time()
+        
+        # Reset line position counter
+        self._current_line_position = 0
         
         # Log recording start
         if duration_seconds is None:
@@ -350,11 +751,15 @@ class Recorder:
                 self._collect_data_sample(data, idx)
                 idx += config.recording.cross_correlations_per_batch
                 
+                # Update cumulative line position
+                self._current_line_position += config.recording.cross_correlations_per_batch
+                
                 # Check if batch is complete
                 if idx >= config.recording.rows_per_batch:
+                    # Save to regular batch file
                     self._save_batch(data, batch_num, start_time, duration_seconds, progress_callback)
-                    idx = 0
                     batch_num += 1
+                    idx = 0
                 
                 time.sleep(self._waittime)
                     
@@ -379,6 +784,12 @@ class Recorder:
             # Add data to plotting buffer
             self._add_to_buffer(data[idx:idx+config.recording.cross_correlations_per_batch])
             
+            # Record antenna positions every 10 lines (one time integration)
+            try:
+                self._record_antenna_positions()
+            except Exception as e:
+                logger.warning(f"Failed to record antenna positions: {e}")
+            
         except Exception as e:
             raise DataCollectionError(f"Error during data collection: {e}")
 
@@ -392,6 +803,8 @@ class Recorder:
     ) -> None:
         """Save a complete batch of data."""
         logger.info(f"{Colors.GREEN}Completed batch {batch_num} with {config.recording.rows_per_batch} lines, saving file...{Colors.RESET}")
+        
+        # Save the batch
         self._save_array(data, batch_num=batch_num)
         
         # Update progress
@@ -422,11 +835,16 @@ class Recorder:
         if progress_callback:
             self._send_completion_progress(duration_seconds, progress_callback)
         
+        # Save positions file
+        self._save_positions_file()
+        
         # Log completion
         if duration_seconds is None:
-            logger.info(f"{Colors.GREEN}Continuous recording completed successfully - saved {batch_num-1} complete batches{Colors.RESET}")
+            logger.info(f"{Colors.GREEN}Continuous recording completed - saved {batch_num-1} complete batches{Colors.RESET}")
         else:
             logger.info(f"{Colors.GREEN}Recording completed successfully{Colors.RESET}")
+        
+        logger.info(f"Total lines recorded: {self._current_line_position}")
 
     def _update_progress(
         self, 
@@ -485,7 +903,7 @@ class Recorder:
             fftshift_p0, fftshift_p1 = self.get_fftshift()
             acclen = self.get_acclen()
             
-            # Create filename with FFT shift and accumulation length
+            # Create standard filename with FFT shift and accumulation length
             if batch_num is not None:
                 filename = os.path.join(self._save_dir, f'data_batch_{batch_num:04d}_{save_timestamp}_fft{fftshift_p0}_{fftshift_p1}_acc{acclen}.npy')
             elif suffix:
@@ -531,8 +949,30 @@ class Recorder:
             except Exception as e:
                 logger.warning(f"{Colors.RED}Error closing recorder device: {e}{Colors.RESET}")
 
+    def _cleanup_position_tracking(self) -> None:
+        """Clean up position tracking MQTT clients and save any remaining positions."""
+        # Save final positions if recording was active and positions haven't been saved yet
+        # (This is mainly for emergency cleanup scenarios)
+        if self._save_dir is not None and self._is_recording:
+            logger.info("Emergency cleanup: saving remaining positions")
+            self._save_positions_file()
+        
+        # Close MQTT clients
+        for ant in ['N', 'S']:
+            client = self._mqtt_clients[ant]
+            if client is not None:
+                try:
+                    client.loop_stop()
+                    client.disconnect()
+                    self._mqtt_clients[ant] = None
+                    logger.info(f"{Colors.BLUE}Closed MQTT client for antenna {ant}{Colors.RESET}")
+                except Exception as e:
+                    logger.warning(f"{Colors.RED}Error closing MQTT client for antenna {ant}: {e}{Colors.RESET}")
+
     def _reset_internal_state(self) -> None:
         """Reset internal state variables."""
         self._is_recording = False
         self._interrupted = False
-        self._save_dir = None 
+        self._save_dir = None
+        # Clear positions buffer
+        self.clear_positions_buffer() 

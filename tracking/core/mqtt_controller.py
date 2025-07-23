@@ -113,13 +113,39 @@ class MqttController:
         else:
             raise ValueError("How did tis happen?")
 
-        self.mqtt_client = mqtt.Client(client_id=config.mqtt.client_id)
+        # Create unique client ID to avoid conflicts
+        import uuid
+        unique_client_id = f"{config.mqtt.client_id}_{ant}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+        
+        # Clean up any existing client
+        if hasattr(self, 'mqtt_client') and self.mqtt_client is not None:
+            try:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+            except:
+                pass  # Ignore cleanup errors
+        
+        self.mqtt_client = mqtt.Client(client_id=unique_client_id)
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
+        self.mqtt_client.on_disconnect = self.on_disconnect
         
-        # Connect to broker
-        self.mqtt_client.connect(broker_ip, port, config.mqtt.connection_timeout)
-        self.mqtt_client.loop_start()
+        # Set keep alive and other options for better reliability
+        self.mqtt_client._keepalive = 60
+        
+        # Connect to broker with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to {broker_ip}:{port} (attempt {attempt + 1}/{max_retries})...")
+                self.mqtt_client.connect(broker_ip, port, config.mqtt.connection_timeout)
+                self.mqtt_client.loop_start()
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise ConnectionError(f"Failed to connect after {max_retries} attempts: {e}")
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}, retrying...")
+                time.sleep(1)
         
         # Wait for connection
         timeout = config.mqtt.connection_wait_timeout
@@ -141,6 +167,12 @@ class MqttController:
         self.mqtt_client.subscribe(self.topic_act_time)
         self.mqtt_client.subscribe(self.topic_start_time)
         
+    def on_disconnect(self, client, userdata, rc):
+        """Handle MQTT disconnection events."""
+        if rc != 0:
+            logger.warning(f"{Colors.RED}Unexpected MQTT disconnection (code {rc}){Colors.RESET}")
+        self.mqtt_connected = False
+        
     def send_mqtt_command(self, topic, command_dict):
         """
         Send a JSON-encoded command via MQTT.
@@ -157,10 +189,22 @@ class MqttController:
         try:
             message = json.dumps(command_dict)
             result = self.mqtt_client.publish(topic, message)
+            
+            # Wait for the message to be sent
+            result.wait_for_publish(timeout=2.0)
+            
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                logger.error(f"{Colors.RED}Failed to publish MQTT message: {result.rc}{Colors.RESET}")
+                error_msg = f"Failed to publish MQTT message: {result.rc}"
+                if result.rc == 4:  # MQTT_ERR_NO_CONN
+                    error_msg += " (No connection to broker)"
+                    self.mqtt_connected = False
+                logger.error(f"{Colors.RED}{error_msg}{Colors.RESET}")
+                raise ConnectionError(error_msg)
+                
         except Exception as e:
             logger.error(f"{Colors.RED}Error sending MQTT command: {e}{Colors.RESET}")
+            if "not connected" in str(e).lower():
+                self.mqtt_connected = False
             raise
         
     def read_mqtt_topic(self, topic, timeout=None):
@@ -181,6 +225,11 @@ class MqttController:
         if timeout is None:
             timeout = config.mqtt.read_timeout
             
+        # Check if we're still connected
+        if not self.mqtt_connected:
+            logger.debug(f"Not connected to MQTT broker when trying to read {topic}")
+            return None
+            
         # Clear previous message
         if topic in self.messages:
             del self.messages[topic]
@@ -188,11 +237,40 @@ class MqttController:
         # Wait for new message
         start_time = time.time()
         while topic not in self.messages and (time.time() - start_time) < timeout:
+            # Check connection status during wait
+            if not self.mqtt_connected:
+                logger.debug(f"Lost connection while waiting for message on {topic}")
+                return None
             time.sleep(config.mqtt.poll_sleep_interval)
             
         if topic in self.messages:
             return self.messages[topic]
+        
+        # Log timeout for debugging
+        logger.debug(f"Timeout waiting for message on {topic} after {timeout:.1f}s")
         return None
+        
+    def check_connection(self):
+        """
+        Check MQTT connection status and attempt reconnection if needed.
+        
+        Returns:
+            bool: True if connected, False if unable to connect
+        """
+        if self.mqtt_connected and self.mqtt_client is not None:
+            return True
+            
+        if not hasattr(self, 'ant') or self.ant is None:
+            logger.warning("Cannot reconnect: antenna not set")
+            return False
+            
+        try:
+            logger.info(f"Attempting to reconnect MQTT for antenna {self.ant}...")
+            self.setup_mqtt(self.ant)
+            return self.mqtt_connected
+        except Exception as e:
+            logger.error(f"Reconnection failed: {e}")
+            return False
         
     def set_axis_mode_track(self):
         """
