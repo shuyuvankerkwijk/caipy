@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-import os
+"""
+High-level telescope tracking operations (slew, track, park). Exposes a structured API.
+"""
+
 import signal
 import numpy as np
 from time import sleep, time
@@ -9,22 +11,18 @@ from typing import Optional, Callable, Any, Union, List
 import logging
 from astropy.coordinates import SkyCoord
 from astropy import units as u
-
-
 from tracking.utils.helpers import xel2az, sync_to_half_second, angular_separation
 from tracking.core.astro_pointing import AstroPointing
 from tracking.core.mqtt_controller import MqttController
 from tracking.core.safety_checker import SafetyChecker
 from tracking.utils.config import config
 from tracking.utils.source import Source
-from tracking.utils.exceptions import (
-    TrackingError, SafetyError, MQTTError, ValidationError, 
-    ConfigurationError, OperationError, TimeoutError
-)
+from tracking.utils.exceptions import TrackingError, SafetyError, MQTTError, ValidationError, ConfigurationError, OperationError, TimeoutError
 from tracking.utils.colors import Colors
 from tracking.utils.progress import ProgressCallback, ProgressInfo, OperationType
 from tracking.utils.helpers import d2m
 from tracking.utils.coordinate_utils import get_targets_offsets
+from tracking.utils.antenna import Antenna, parse_antenna, antenna_letter
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -56,7 +54,7 @@ class Tracker:
         self.safety_checker = SafetyChecker()
         self.pointing = AstroPointing()
         self.mqtt = MqttController()
-        self.ant: Optional[str] = None
+        self.ant: Optional[Antenna] = None
         self.state: State = State.IDLE
         self._is_initialized: bool = False
         
@@ -67,25 +65,24 @@ class Tracker:
     # PUBLIC API METHODS
     # ============================================================================
 
-    def run_track(self, ant: str, source: Source, duration_hours: float, 
+    def run_track(self, ant: Antenna, source: Source, duration_hours: float, 
                   slew: bool = True, park: bool = True, 
                   progress_callback: Optional[ProgressCallback] = None,
                   auto_cleanup: bool = True,
-                  on_track_start: Optional[Callable] = None,
-                  on_track_stop: Optional[Callable] = None) -> bool:
+                  on_run_signal: Optional[Callable] = None) -> bool:
         """
-        Run the tracker for one antenna, in ["N", "S"]. Handles slewing, tracking, and parking in sequence.
+        Run the tracker for one antenna (Antenna.NORTH or Antenna.SOUTH).
+        Handles slewing, tracking, and parking in sequence.
         
         Args:
-            ant: Antenna identifier ("N" or "S")
+            ant: Antenna enum (Antenna.NORTH or Antenna.SOUTH)
             source: Source object with coordinates
             duration_hours: Duration to track in hours
             slew: Whether to slew to target before tracking (default: True)
             park: Whether to park after tracking (default: True)
             progress_callback: Optional ProgressCallback for detailed progress updates
             auto_cleanup: Whether to automatically cleanup and disconnect MQTT (default: True)
-            on_track_start: Optional callback to run when tracking begins
-            on_track_stop: Optional callback to run when tracking ends
+            on_run_signal: Optional callback to run when tracking begins
             
         Returns:
             bool: True if successful, False otherwise
@@ -96,7 +93,7 @@ class Tracker:
             MQTTError: If MQTT communication fails
             OperationError: If tracking operation fails
         """
-        logger.info(f"Starting tracking run for antenna {ant}")
+        logger.info(f"[{antenna_letter(ant)}] Starting tracking run")
         logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
         logger.info(f"Duration: {duration_hours:.4f} hours")
 
@@ -104,49 +101,91 @@ class Tracker:
             if not self._setup(ant):
                 raise OperationError("Failed to setup tracker")
 
-            # Validate target coordinates
             self._validate_target(source, ant, duration_hours)
 
-            # Slew to target if requested
             if slew:
-                logger.info(f"{Colors.BLUE}Slewing to target...{Colors.RESET}")
+                logger.info(f"Slewing to target...")
                 if not self._slew(source=source, progress_callback=progress_callback):
                     raise OperationError("Slewing failed")
-
-            # Track source
-            logger.info(f"{Colors.BLUE}Starting tracking...{Colors.RESET}")
-            if progress_callback:
-                progress_info = ProgressInfo(
-                    operation_type=OperationType.TRACK,
-                    antenna=self.ant,
-                    percent_complete=0.0,
-                    message="Starting tracking operation"
-                )
-                progress_callback(progress_info)
             
-            if not self._track(source, duration_hours, progress_callback=progress_callback, on_track_start=on_track_start, on_track_stop=on_track_stop):
+            if not self._track(source, duration_hours, progress_callback=progress_callback, on_run_signal=on_run_signal):
                 raise OperationError("Tracking failed")
 
-            # Park if requested
             if park:
-                logger.info(f"{Colors.BLUE}Parking telescope...{Colors.RESET}")
+                logger.info(f"Parking telescope...")
                 if not self._park(progress_callback=progress_callback):
                     raise OperationError("Parking failed")
             
-            logger.info(f"{Colors.GREEN}Tracking run completed successfully{Colors.RESET}")
             return True
             
         except (SafetyError, MQTTError, ValidationError, OperationError) as e:
-            logger.error(f"{Colors.RED}Tracking failed: {e}{Colors.RESET}")
+            logger.error(f"Tracking failed: {e}")
+            if on_run_signal:
+                on_run_signal('stop_run')
             raise
         except Exception as e:
             error_msg = f"Unexpected error in tracking run: {e}"
-            logger.error(f"{Colors.RED}{error_msg}{Colors.RESET}")
+            logger.error(f"{error_msg}")
+            if on_run_signal:
+                on_run_signal('stop_run')
             raise OperationError(error_msg)
         finally:
             self._cleanup(auto_cleanup)
 
-    def run_slew(self, ant: str, source: Optional[Source] = None, 
+    def run_track_multiple(self, ant: Antenna, sources: List[Source], duration_hours: float, 
+                           slew: bool = True, park: bool = True,
+                           operation_type: Optional[OperationType] = OperationType.TRACK,
+                           progress_callback: Optional[ProgressCallback] = None,
+                           auto_cleanup: bool = True,
+                           on_run_signal: Optional[Callable] = None,
+                           on_point_signal: Optional[Callable] = None) -> bool:
+        """
+        Run the tracker for multiple sources for a given duration at each one.
+        """
+        logger.info(f"[{antenna_letter(ant)}] Starting multiple tracking run")
+        logger.info(f"First target: RA={sources[0].ra_hrs:.6f}h, Dec={sources[0].dec_deg:.6f}°")
+        logger.info(f"Duration: {duration_hours:.4f} hours at each target")
+
+        try:
+            if not self._setup(ant):
+                raise OperationError("Failed to setup tracker")
+
+            now = datetime.now(timezone.utc)
+            for i, scan_source in enumerate(sources):
+                logger.debug(f"Validating scan position {i+1}/{len(sources)}")
+                start_time = now + timedelta(hours=i * duration_hours)
+                self._validate_target(scan_source, ant, duration_hours, start_time=start_time)
+
+            if slew:
+                logger.info(f"Slewing to first scan position...")
+                if not self._slew(source=sources[0], progress_callback=progress_callback):
+                    raise OperationError("Slewing to first position failed")
+            
+            if not self._track_multiple(sources, duration_hours, operation_type, progress_callback, on_run_signal=on_run_signal, on_point_signal=on_point_signal):
+                raise OperationError("Rasta scan failed")
+
+            if park:
+                logger.info(f"Parking telescope...")
+                if not self._park(progress_callback=progress_callback):
+                    raise OperationError("Parking failed")
+
+            return True
+            
+        except (SafetyError, MQTTError, ValidationError, OperationError) as e:
+            logger.error(f"Track multiple failed: {e}")
+            if on_run_signal:
+                on_run_signal('stop_run')
+            raise
+        except Exception as e:
+            error_msg = f"Unexpected error in track multiple: {e}"
+            logger.error(f"{error_msg}")
+            if on_run_signal:
+                on_run_signal('stop_run')
+            raise OperationError(error_msg)
+        finally:
+            self._cleanup(auto_cleanup)
+
+    def run_slew(self, ant: Antenna, source: Optional[Source] = None, 
                  az: Optional[float] = None, el: Optional[float] = None, 
                  progress_callback: Optional[ProgressCallback] = None,
                  auto_cleanup: bool = True) -> bool:
@@ -154,7 +193,7 @@ class Tracker:
         Slew to a target position. Returns True if successful, False otherwise.
         
         Args:
-            ant: Antenna identifier ("N" or "S")
+            ant: Antenna enum (Antenna.NORTH or Antenna.SOUTH)
             source: Optional Source object with coordinates
             az: Optional azimuth in degrees
             el: Optional elevation in degrees
@@ -170,7 +209,7 @@ class Tracker:
             MQTTError: If MQTT communication fails
             OperationError: If slewing operation fails
         """
-        logger.info(f"{Colors.BLUE}Starting slew operation for antenna {ant}{Colors.RESET}")
+        logger.info(f"[{antenna_letter(ant)}] Starting slew operation")
         
         try:
             if not self._setup(ant):
@@ -191,27 +230,27 @@ class Tracker:
             else:
                 raise ValidationError("No target or coordinates provided")
             
-            logger.info(f"{Colors.GREEN}Slewing completed successfully{Colors.RESET}")
+            logger.info(f"Slewing completed successfully")
             return True
 
         except (SafetyError, MQTTError, ValidationError, OperationError) as e:
-            logger.error(f"{Colors.RED}Slewing failed: {e}{Colors.RESET}")
+            logger.error(f"Slewing failed: {e}")
             raise
         except Exception as e:
             error_msg = f"Unexpected error in slew operation: {e}"
-            logger.error(f"{Colors.RED}{error_msg}{Colors.RESET}")
+            logger.error(f"{error_msg}")
             raise OperationError(error_msg)
         finally:
             self._cleanup(auto_cleanup)
     
-    def run_park(self, ant: str, 
+    def run_park(self, ant: Antenna, 
                  progress_callback: Optional[ProgressCallback] = None,
                  auto_cleanup: bool = True) -> bool:
         """
         Park the telescope. Returns True if successful, False otherwise.
         
         Args:
-            ant: Antenna identifier ("N" or "S")
+            ant: Antenna enum (Antenna.NORTH or Antenna.SOUTH)
             progress_callback: Optional ProgressCallback for detailed progress updates
             auto_cleanup: Whether to automatically cleanup and disconnect MQTT (default: True)
             
@@ -223,7 +262,7 @@ class Tracker:
             MQTTError: If MQTT communication fails
             OperationError: If parking operation fails
         """
-        logger.info(f"{Colors.BLUE}Starting park operation for antenna {ant}{Colors.RESET}")
+        logger.info(f"[{antenna_letter(ant)}] Starting park operation")
         
         try:
             if not self._setup(ant):
@@ -232,15 +271,15 @@ class Tracker:
             if not self._park(progress_callback=progress_callback):
                 raise OperationError("Parking failed")
 
-            logger.info(f"{Colors.GREEN}Parking completed successfully{Colors.RESET}")
+            logger.info(f"Parking completed successfully")
             return True
 
         except (MQTTError, ValidationError, OperationError) as e:
-            logger.error(f"{Colors.RED}Parking failed: {e}{Colors.RESET}")
+            logger.error(f"Parking failed: {e}")
             raise
         except Exception as e:
             error_msg = f"Unexpected error in park operation: {e}"
-            logger.error(f"{Colors.RED}{error_msg}{Colors.RESET}")
+            logger.error(f"{error_msg}")
             raise OperationError(error_msg)
         finally:
             self._cleanup(auto_cleanup)
@@ -255,31 +294,15 @@ class Tracker:
                 self.mqtt.set_axis_mode_stop()
                 current_pos = self.mqtt.get_current_position()
                 if current_pos[0] is not None and current_pos[1] is not None:
-                    logger.info(f"{Colors.RED}Antenna {self.ant} stopped at: ({current_pos[0]:.2f}, {current_pos[1]:.2f}){Colors.RESET}")
+                    logger.info(f"[{antenna_letter(self.ant)}] Stopped at: ({current_pos[0]:.2f}, {current_pos[1]:.2f})")
                 else:
-                    logger.info(f"{Colors.RED}Antenna {self.ant} stopped (position unknown){Colors.RESET}")
+                    logger.info(f"[{antenna_letter(self.ant)}] Stopped (position unknown)")
             else:
-                logger.warning(f"{Colors.RED}MQTT not available for stop command{Colors.RESET}")
+                logger.warning(f"MQTT not available for stop command")
         except Exception as e:
-            logger.error(f"{Colors.RED}Error stopping motion: {e}{Colors.RESET}")
+            logger.error(f"Error stopping motion: {e}")
             return False
         return True
-
-    # def get_current_position(self) -> tuple:
-    #     """
-    #     Get the current telescope position.
-        
-    #     Returns:
-    #         tuple: (azimuth, elevation) in degrees, or (None, None) if not available
-    #     """
-    #     try:
-    #         if hasattr(self, 'mqtt') and self.mqtt is not None:
-    #             return self.mqtt.get_current_position()
-    #         else:
-    #             return (None, None)
-    #     except Exception as e:
-    #         logger.warning(f"Error getting current position: {e}")
-    #         return (None, None)
     
     def cleanup(self) -> None:
         """
@@ -288,27 +311,27 @@ class Tracker:
         Sends stop commands to both axes and properly disconnects the MQTT client.
         Should be called when tracking is complete or interrupted.
         """
-        logger.info(f"{Colors.BLUE}Cleaning up resources...{Colors.RESET}")
+        logger.info(f"Cleaning up resources...")
         
         # Stop motion if MQTT is available
         if hasattr(self, 'mqtt') and self.mqtt is not None:
             try:
                 self.stop()
             except Exception as e:
-                logger.warning(f"{Colors.RED}Error stopping motion: {e}{Colors.RESET}")
+                logger.warning(f"Error stopping motion: {e}")
             
             # Disconnect MQTT if client exists
             if hasattr(self.mqtt, 'mqtt_client') and self.mqtt.mqtt_client is not None:
                 try:
                     self.mqtt.mqtt_client.loop_stop()
                     self.mqtt.mqtt_client.disconnect()
-                    logger.info(f"{Colors.BLUE}MQTT disconnected{Colors.RESET}")
+                    logger.info(f"MQTT disconnected")
                 except Exception as e:
-                    logger.warning(f"{Colors.RED}Error disconnecting MQTT: {e}{Colors.RESET}")
+                    logger.warning(f"Error disconnecting MQTT: {e}")
             else:
-                logger.warning(f"{Colors.RED}MQTT client not initialized{Colors.RESET}")
+                logger.warning(f"MQTT client not initialized")
         else:
-            logger.warning(f"{Colors.RED}MQTT controller not initialized{Colors.RESET}")
+            logger.warning(f"MQTT controller not initialized")
 
         # Reset state
         if hasattr(self, 'ant') and self.ant is not None:
@@ -317,7 +340,7 @@ class Tracker:
             self.state = State.IDLE
         self._is_initialized = False
 
-        logger.info(f"{Colors.GREEN}Cleanup complete{Colors.RESET}")
+        logger.info(f"Cleanup complete")
 
     # ============================================================================
     # SPECIALTY METHODS
@@ -327,8 +350,8 @@ class Tracker:
                        slew: bool = True, park: bool = True,
                        progress_callback: Optional[ProgressCallback] = None,
                        auto_cleanup: bool = True,
-                       on_track_start: Optional[Callable] = None,
-                       on_track_stop: Optional[Callable] = None) -> bool:
+                       on_run_signal: Optional[Callable] = None,
+                       on_point_signal: Optional[Callable] = None) -> bool:
         """
         Run a Rasta scan. Returns True if successful, False otherwise.
         
@@ -343,8 +366,8 @@ class Tracker:
             park: Whether to park after scanning (default: True)
             progress_callback: Optional ProgressCallback for detailed progress updates
             auto_cleanup: Whether to automatically cleanup and disconnect MQTT (default: True)
-            on_track_start: Optional callback to run when tracking begins
-            on_track_stop: Optional callback to run when tracking ends
+            on_run_signal: Optional callback to run when tracking begins
+            on_point_signal: Optional callback to run when tracking ends
             
         Returns:
             bool: True if successful, False otherwise
@@ -355,12 +378,11 @@ class Tracker:
             MQTTError: If MQTT communication fails
             OperationError: If tracking operation fails
         """
-        logger.info(f"{Colors.BLUE}Starting Rasta scan for antenna {ant}{Colors.RESET}")
+        logger.info(f"[{ant}] Starting Rasta scan")
         logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
         logger.info(f"Max distance: {max_distance_deg:.2f}°, Steps: {steps_deg:.2f}°")
         logger.info(f"Duration: {duration_hours:.2f} hours at each step")
 
-        # Validate input parameters
         if max_distance_deg <= 0:
             raise ValidationError(f"max_distance_deg must be positive, got {max_distance_deg}")
         if steps_deg <= 0:
@@ -370,7 +392,6 @@ class Tracker:
         if steps_deg > max_distance_deg:
             raise ValidationError(f"steps_deg ({steps_deg}) cannot be larger than max_distance_deg ({max_distance_deg})")
 
-        # Make a list of steps
         steps = np.arange(-max_distance_deg, max_distance_deg + steps_deg, steps_deg)
         if len(steps) == 0:
             raise ValidationError("No scan positions generated. Check max_distance_deg and steps_deg values.")
@@ -387,58 +408,14 @@ class Tracker:
 
         logger.info(f"Generated {len(sources)} scan positions")
 
-        try:
-            if not self._setup(ant):
-                raise OperationError("Failed to setup tracker")
-
-            # Validate each source individually with its own duration
-            total_duration = duration_hours * len(sources)
-            for i, scan_source in enumerate(sources):
-                logger.debug(f"Validating scan position {i+1}/{len(sources)}")
-                self._validate_target(scan_source, ant, duration_hours)
-
-            # Also perform a total duration safety check with the center source
-            logger.info(f"Performing total duration safety check ({total_duration:.2f} hours)")
-            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, total_duration)
-            if not safety_result.is_safe:
-                raise SafetyError(f"Total duration safety check failed: {safety_result.message}")
-
-            # Slew to first target position if requested
-            if slew:
-                logger.info(f"{Colors.BLUE}Slewing to first scan position...{Colors.RESET}")
-                if not self._slew(source=sources[0], progress_callback=progress_callback):
-                    raise OperationError("Slewing to first position failed")
-            
-            # Track source at every offset
-            if not self._track_multiple(sources, duration_hours, OperationType.RASTA_SCAN, progress_callback, on_track_start=on_track_start, on_track_stop=on_track_stop):
-                raise OperationError("Rasta scan failed")
-
-            logger.info(f"{Colors.GREEN}Rasta scan completed successfully{Colors.RESET}")
-
-            # Park the telescope if requested
-            if park:
-                logger.info(f"{Colors.BLUE}Parking telescope...{Colors.RESET}")
-                if not self._park(progress_callback=progress_callback):
-                    raise OperationError("Parking failed")
-
-            return True
-            
-        except (SafetyError, MQTTError, ValidationError, OperationError) as e:
-            logger.error(f"{Colors.RED}Rasta scan failed: {e}{Colors.RESET}")
-            raise
-        except Exception as e:
-            error_msg = f"Unexpected error in rasta scan: {e}"
-            logger.error(f"{Colors.RED}{error_msg}{Colors.RESET}")
-            raise OperationError(error_msg)
-        finally:
-            self._cleanup(auto_cleanup)
+        return self.run_track_multiple(ant, sources, duration_hours, slew, park, OperationType.RASTA_SCAN, progress_callback, auto_cleanup, on_run_signal, on_point_signal)
 
     def run_pointing_offsets(self, ant: str, source: Source, closest_distance_deg: float, number_of_points: int,
                              duration_hours: float, slew: bool = True, park: bool = True,
                              progress_callback: Optional[ProgressCallback] = None,
                              auto_cleanup: bool = True,
-                             on_track_start: Optional[Callable] = None,
-                             on_track_stop: Optional[Callable] = None) -> bool:
+                             on_run_signal: Optional[Callable] = None,
+                             on_point_signal: Optional[Callable] = None) -> bool:
         """Run a pointing-offset pattern (cross / triangle etc.) around *source*.
 
         This helper generates *number_of_points* offsets (5, 7, 9, 13 supported – see
@@ -446,21 +423,20 @@ class Tracker:
         centre and tracks each position for *duration_hours*.
 
         Except for the way the offset list is generated this is identical to
-        :py:meth:`run_rasta_scan` and therefore re-uses the same validation, slew,
+        `run_rasta_scan` and therefore re-uses the same validation, slew,
         tracking and parking logic.
         """
-        logger.info(f"{Colors.BLUE}Starting pointing-offset scan for antenna {ant}{Colors.RESET}")
-        logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
-        logger.info(f"Closest distance: {closest_distance_deg:.2f}°, Points: {number_of_points}")
-        logger.info(f"Duration: {duration_hours:.2f} hours at each point")
-
-        # Basic validation of arguments
         if closest_distance_deg <= 0:
             raise ValidationError(f"closest_distance_deg must be positive, got {closest_distance_deg}")
         if number_of_points <= 0:
             raise ValidationError(f"number_of_points must be positive, got {number_of_points}")
         if duration_hours <= 0:
             raise ValidationError(f"duration_hours must be positive, got {duration_hours}")
+        
+        logger.info(f"[{ant}] Starting pointing-offset scan")
+        logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
+        logger.info(f"Closest distance: {closest_distance_deg:.2f}°, Points: {number_of_points}")
+        logger.info(f"Duration: {duration_hours:.2f} hours at each point")
 
         try:
             ra_list, dec_list = get_targets_offsets(closest_distance_deg, number_of_points,
@@ -471,53 +447,41 @@ class Tracker:
         sources = [Source(ra_hrs=ra, dec_deg=dec) for ra, dec in zip(ra_list, dec_list)]
         logger.info(f"Generated {len(sources)} pointing-offset positions")
 
-        # Total duration for safety check
-        total_duration = duration_hours * len(sources)
+        return self.run_track_multiple(ant, sources, duration_hours, slew, park, OperationType.POINTING_OFFSETS, progress_callback, auto_cleanup, on_run_signal, on_point_signal)
 
-        try:
-            if not self._setup(ant):
-                raise OperationError("Failed to setup tracker")
+    def run_rtos(self, ant: str, source1: Source, source2: Source, number_of_points: int,
+                             duration_hours: float, slew: bool = True, park: bool = True,
+                             progress_callback: Optional[ProgressCallback] = None,
+                             auto_cleanup: bool = True,
+                             on_run_signal: Optional[Callable] = None,
+                             on_point_signal: Optional[Callable] = None) -> bool:
+        """Run a RTOS between two sources
+        """
 
-            # Validate each individual source
-            for idx, scan_source in enumerate(sources):
-                logger.debug(f"Validating offset position {idx+1}/{len(sources)}")
-                self._validate_target(scan_source, ant, duration_hours)
+        if number_of_points <= 0:
+            raise ValidationError(f"number_of_points must be positive, got {number_of_points}")
+        if duration_hours <= 0:
+            raise ValidationError(f"duration_hours must be positive, got {duration_hours}")
+        
+        logger.info(f"[{ant}] Starting pointing-offset scan")
+        logger.info(f"Target 1: RA={source1.ra_hrs:.6f}h, Dec={source1.dec_deg:.6f}°")
+        logger.info(f"Target 2: RA={source2.ra_hrs:.6f}h, Dec={source2.dec_deg:.6f}°")
+        logger.info(f"Duration: {duration_hours:.2f} hours at each point")
 
-            # Perform combined safety check at centre for total duration
-            logger.info(f"Performing total duration safety check ({total_duration:.2f} hours)")
-            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, total_duration)
-            if not safety_result.is_safe:
-                raise SafetyError(f"Total duration safety check failed: {safety_result.message}")
+        ra_list = []
+        dec_list = []
+        for i in range(number_of_points):
+            if i % 2 == 0:
+                ra_list.append(source1.ra_hrs)
+                dec_list.append(source1.dec_deg)
+            else:
+                ra_list.append(source2.ra_hrs)
+                dec_list.append(source2.dec_deg)
 
-            # Optional slew to first point
-            if slew:
-                logger.info(f"{Colors.BLUE}Slewing to first offset position...{Colors.RESET}")
-                if not self._slew(source=sources[0], progress_callback=progress_callback):
-                    raise OperationError("Slewing to first position failed")
+        sources = [Source(ra_hrs=ra, dec_deg=dec) for ra, dec in zip(ra_list, dec_list)]
+        logger.info(f"Generated {len(sources)} pointing-offset positions")
 
-            # Track each offset using existing _rasta_scan helper
-            if not self._track_multiple(sources, duration_hours, OperationType.POINTING_OFFSETS, progress_callback, on_track_start=on_track_start, on_track_stop=on_track_stop):
-                raise OperationError("Pointing-offset scan failed")
-
-            logger.info(f"{Colors.GREEN}Pointing-offset scan completed successfully{Colors.RESET}")
-
-            # Optional park after completion
-            if park:
-                logger.info(f"{Colors.BLUE}Parking telescope...{Colors.RESET}")
-                if not self._park(progress_callback=progress_callback):
-                    raise OperationError("Parking failed")
-
-            return True
-
-        except (SafetyError, MQTTError, ValidationError, OperationError) as e:
-            logger.error(f"{Colors.RED}Pointing-offset scan failed: {e}{Colors.RESET}")
-            raise
-        except Exception as e:
-            err_msg = f"Unexpected error in pointing-offset scan: {e}"
-            logger.error(f"{Colors.RED}{err_msg}{Colors.RESET}")
-            raise OperationError(err_msg)
-        finally:
-            self._cleanup(auto_cleanup)
+        return self.run_track_multiple(ant, sources, duration_hours, slew, park, OperationType.RTOS, progress_callback, auto_cleanup, on_run_signal, on_point_signal)
 
     # ============================================================================
     # PRIVATE HELPER METHODS
@@ -526,7 +490,7 @@ class Tracker:
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
         def signal_handler(signum: int, frame: Any) -> None:
-            logger.warning(f"{Colors.RED}Received signal {signum}, initiating graceful shutdown{Colors.RESET}")
+            logger.warning(f"Received signal {signum}, initiating graceful shutdown")
             self.stop()
             
             if signum == signal.SIGINT:
@@ -535,7 +499,7 @@ class Tracker:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-    def _setup(self, ant: str) -> bool:
+    def _setup(self, ant: Antenna) -> bool:
         """
         Setup the tracker for an operation.
         
@@ -547,8 +511,8 @@ class Tracker:
         """
         try:
             # Validate antenna
-            if ant not in ["N", "S"]:
-                raise ValidationError(f"Invalid antenna '{ant}'. Must be 'N' or 'S'.")
+            if ant not in (Antenna.NORTH, Antenna.SOUTH):
+                raise ValidationError(f"Invalid antenna '{ant}'. Must be Antenna.NORTH or Antenna.SOUTH.")
             
             # Check if we need to reinitialize (different antenna or not initialized)
             antenna_changed = hasattr(self, 'ant') and self.ant != ant
@@ -559,7 +523,7 @@ class Tracker:
             
             # Connect to MQTT only if needed
             if needs_mqtt_setup:
-                logger.info(f"{Colors.BLUE}Setting up MQTT connection for antenna {ant}...{Colors.RESET}")
+                logger.info(f"Setting up MQTT connection for antenna {antenna_letter(ant)}...")
                 self.mqtt.setup_mqtt(ant)
                 self._is_initialized = True
             else:
@@ -575,28 +539,31 @@ class Tracker:
                 raise
             raise MQTTError(f"Setup failed: {e}")
 
-    def _validate_target(self, source: Source, ant: str, duration_hours: Optional[float] = None) -> None:
+    def _validate_target(self, source: Source, ant: str, duration_hours: Optional[float] = None, start_time: Optional[datetime] = None) -> None:
         """Validate target coordinates and safety."""
-        logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
-        validation_result = self.safety_checker.validate_target(pointing=self.pointing, source=source, ant=ant)
+        logger.info(f"Performing target validation...")
+        validation_result = self.safety_checker.validate_target(pointing=self.pointing, source=source, ant=ant, check_time=start_time)
+        validation_result.log_result(logger, "Target validation")
         if not validation_result.is_safe:
             raise SafetyError(f"Target validation failed: {validation_result.message}")
 
         if duration_hours is not None:
-            logger.info(f"{Colors.BLUE}Performing sun safety check...{Colors.RESET}")
-            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, duration_hours)
+            logger.info(f"Performing sun safety check...")
+            safety_result = self.safety_checker.check_run_safety(source.ra_hrs, source.dec_deg, duration_hours, start_time=start_time)
+            safety_result.log_result(logger, "Sun safety check")
             if not safety_result.is_safe:
                 raise SafetyError(f"Sun safety check failed: {safety_result.message}")
 
     def _validate_target_coordinates(self, az: float, el: float, ant: str) -> None:
         """Validate target coordinates."""
-        logger.info(f"{Colors.BLUE}Performing target validation...{Colors.RESET}")
-        validation_result = self.safety_checker.validate_target(az=az, el=el, ant=ant)
+        logger.info(f"Performing target validation...")
+        validation_result = self.safety_checker.validate_target(az=az, el=el)
+        validation_result.log_result(logger, "Target validation")
         if not validation_result.is_safe:
             raise SafetyError(f"Target validation failed: {validation_result.message}")
 
     def _track_multiple(self, sources: List[Source], duration_hours: float, operation_type: OperationType, progress_callback: Optional[ProgressCallback] = None,
-                    on_track_start: Optional[Callable] = None, on_track_stop: Optional[Callable] = None) -> bool:
+                    on_run_signal: Optional[Callable] = None, on_point_signal: Optional[Callable] = None) -> bool:
         """
         Track multiple sources for a given duration. Returns True if successful, False otherwise.
         
@@ -613,88 +580,55 @@ class Tracker:
             ValidationError: If sources list is empty or invalid
             OperationError: If tracking operation fails
         """
-        logger.info(f"{Colors.BLUE}Starting rasta scan for {len(sources)} sources{Colors.RESET}")
-
-        # Validate sources list
+        logger.info(f"[{antenna_letter(self.ant)}] Starting track multiple for {len(sources)} sources")
         if not sources:
             raise ValidationError("Sources list cannot be empty")
-        
-        # Check if we're in the right state
         if self.state != State.IDLE:
             raise OperationError(f"Operation not completed. Current state: {self.state.value}. Please wait for current operation to complete.")
-        
-        # Check if we're close to the first target
         offset = self._get_current_offset(sources[0]) 
         if offset > config.telescope.start_tracking_tolerance:
-            raise OperationError(f"Too far away from first target. Offset: {offset:.2f} degrees.")
-
-        # Setup tracking
+            raise OperationError(f"Too far away from first target. Offset: {offset:.2f} degrees. Make sure slew is enabled.")
         num_points = int(duration_hours * 3600 / config.telescope.position_update_interval)
-        logger.info(f"Setting up rasta scan for {num_points} points ({duration_hours:.2f} hours) for each of {len(sources)} sources")
-
+        logger.info(f"Setting up track multiple for {num_points} points ({duration_hours:.2f} hours) for each of {len(sources)} sources")
         self.state = State.TRACKING
         self.mqtt.set_axis_mode_track()
         self.mqtt.setup_program_track()
-        logger.info(f"{Colors.BLUE}MQTT setup complete{Colors.RESET}")
-
-        # Send zero start time to wake up broker
+        logger.info(f"MQTT setup complete")
         dzero = '0001-01-01T00:00:00.000'
         self.mqtt.send_track_start_time(dzero)
-
-        # Send start time
-        logger.info(f"{Colors.BLUE}Synchronizing start time...{Colors.RESET}")
+        logger.info(f"Synchronizing start time...")
         sync_to_half_second()
         d0 = datetime.now(timezone.utc)
         d0s = d0.microsecond / 1e6
         if d0s > 0.5:
             d0s = d0s - 0.5
         ds = d0 - timedelta(seconds=d0s)
-        sst = ds + timedelta(seconds=3) + timedelta(seconds=1.173)
+        sst = ds + timedelta(seconds=2.5) + timedelta(seconds=0.5) + timedelta(seconds=config.telescope.sto_N if self.ant == Antenna.NORTH else config.telescope.sto_S)
         self.mqtt.send_track_start_time(d2m(sst))
-
-        # Trigger on_track_start callback if provided (for overall scan start)
-        if on_track_start:
-            logger.info(f"{Colors.BLUE}Calling on_track_start() for overall scan start{Colors.RESET}")
-            on_track_start()
-        else:
-            logger.warning(f"{Colors.RED}on_track_start callback is None{Colors.RESET}")
-
-        logger.info(f"{Colors.BLUE}Starting tracking loop for {num_points} points ({duration_hours:.4f} hours){Colors.RESET}")
-        
+        if on_run_signal:
+            on_run_signal('start_run')
         total_sources = len(sources)
-        rt_offset = 0  # Track cumulative time across all sources
-
+        logger.info(f"Starting tracking loop for {num_points*total_sources} points ({duration_hours*total_sources:.4f} hours)")
+        rt_offset = 0
         for source_idx, source in enumerate(sources):
-            # Trigger on_track_start callback for this specific source/point
-            if on_track_start:
-                # Pass source info to the callback for file naming
-                logger.info(f"{Colors.BLUE}Calling on_track_start(source, {source_idx}) for point start{Colors.RESET}")
-                on_track_start(source, source_idx)
-            else:
-                logger.warning(f"{Colors.RED}on_track_start callback is None for point {source_idx}{Colors.RESET}")
-            
+            if on_point_signal:
+                on_point_signal('start_point', source, source_idx)
             for i in range(num_points):
-                # Check if motion stop requested
                 if self.state == State.STOP:
-                    raise OperationError("Tracking interrupted.")
-                
-                # Get time
+                    if on_point_signal:
+                        on_point_signal('stop_point', source, source_idx)
+                    if on_run_signal:
+                        on_run_signal('stop_run')
+                    raise OperationError("Track multiple interrupted.")
                 ds = ds + timedelta(seconds=0.5)
                 d = ds + timedelta(seconds=2.5)
-                rt = rt_offset + i * 0.5  # Continuous relative time
-
-                # Get azel coordinates
+                rt = rt_offset + i * 0.5
                 mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
-                
-                # Send position command
                 self.mqtt.send_track_position(rt, mnt_az, mnt_el, ds)
-                
-                # Update progress - calculate overall progress across all sources
                 total_points = total_sources * num_points
                 current_point = source_idx * num_points + i + 1
                 percent = current_point / total_points * 100.0
-                
-                if progress_callback and (i + 1) % 1 == 0:  # Update every 1 points (0.5 seconds)
+                if progress_callback and (i + 1) % 5 == 0:
                     progress_info = ProgressInfo(
                         operation_type=operation_type,
                         antenna=self.ant,
@@ -702,130 +636,80 @@ class Tracker:
                         message=f"Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s"
                     )
                     progress_callback(progress_info)
-                
-                # Log progress every 1 points (0.5 seconds)
-                if (i + 1) % 1 == 0:
-                    logger.info(f"{Colors.BLUE}Track progress: Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
-
-            # Trigger on_track_stop callback for this specific source/point
-            if on_track_stop:
-                logger.info(f"{Colors.BLUE}Calling on_track_stop(source, {source_idx}) for point stop{Colors.RESET}")
-                on_track_stop(source, source_idx)
-            else:
-                logger.warning(f"{Colors.RED}on_track_stop callback is None for point {source_idx}{Colors.RESET}")
-            
-            # Update rt_offset for next source
+                if (i + 1) % 5 == 0:
+                    logger.info(f"Track progress: Source {source_idx+1}/{total_sources}, Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s")
+            if on_point_signal:
+                on_point_signal('stop_point', source, source_idx)
             rt_offset += num_points * 0.5
-            
-            # Log completion of this source
-            logger.info(f"{Colors.GREEN}Completed tracking source {source_idx+1}/{total_sources}: {num_points} points processed{Colors.RESET}")
-        
-        # Trigger on_track_stop callback if provided (for overall scan end)
-        if on_track_stop:
-            logger.info(f"{Colors.BLUE}Calling on_track_stop() for overall scan stop{Colors.RESET}")
-            on_track_stop()
-        else:
-            logger.warning(f"{Colors.RED}on_track_stop callback is None for overall scan stop{Colors.RESET}")
+            logger.info(f"Completed tracking source {source_idx+1}/{total_sources}: {num_points} points processed")
+        if on_run_signal:
+            on_run_signal('stop_run')
 
-        # Send completion progress
+        sleep(3)
+
+        logger.info(f"Track multiple completed: {num_points*total_sources} points processed")
         if progress_callback:
             progress_info = ProgressInfo(
                 operation_type=operation_type,
                 antenna=self.ant,
                 percent_complete=100.0,
-                message="Rasta scan completed",
+                message="Track multiple completed",
                 is_complete=True
             )
             progress_callback(progress_info)
-        
-        # Stop tracking
-        logger.info(f"{Colors.RED}Stopping scan{Colors.RESET}")
+        logger.info(f"Stopping track multiple")
         self.mqtt.set_axis_mode_stop()
         self.state = State.IDLE
         return True
 
     def _track(self, source: Source, duration_hours: float, 
                progress_callback: Optional[ProgressCallback] = None,
-               on_track_start: Optional[Callable] = None,
-               on_track_stop: Optional[Callable] = None) -> bool:
+               on_run_signal: Optional[Callable] = None) -> bool:
         """
         Track a source for a given duration. Returns True if successful, False otherwise.
         """
-        logger.info(f"{Colors.BLUE}Starting track_source{Colors.RESET}")
-        
-        # Check if we're in the right state
+        logger.info(f"[{antenna_letter(self.ant)}] Starting track_source")
         if self.state != State.IDLE:
             raise OperationError(f"Operation not completed. Current state: {self.state.value}. Please wait for current operation to complete.")
-        
-        # Check if we're close to the target
         offset = self._get_current_offset(source) 
         if offset > config.telescope.start_tracking_tolerance:
             raise OperationError(f"Too far away from target. Offset: {offset:.2f} degrees.")
-
-        # Setup tracking
         num_points = int(duration_hours * 3600 / config.telescope.position_update_interval)
         logger.info(f"Setting up tracking for {num_points} points ({duration_hours:.2f} hours)")
-        
         self.state = State.TRACKING
         self.mqtt.set_axis_mode_track()
         self.mqtt.setup_program_track()
-        logger.info(f"{Colors.BLUE}MQTT setup complete{Colors.RESET}")
-
-        # Send zero start time to wake up broker
+        logger.info(f"MQTT setup complete")
         dzero = '0001-01-01T00:00:00.000'
         self.mqtt.send_track_start_time(dzero)
-
-        # Send start time
-        logger.info(f"{Colors.BLUE}Synchronizing start time...{Colors.RESET}")
+        logger.info(f"Synchronizing start time...")
         sync_to_half_second() # wait until next half second boundary (x.0, x.5)
         d0 = datetime.now(timezone.utc) # get current time
         d0s = d0.microsecond / 1e6 # get fractional part of current second
         if d0s > 0.5: 
             d0s = d0s - 0.5
         ds = d0 - timedelta(seconds=d0s) # get most recent 0.0 or 0.5 second boundary
-        sst = ds + timedelta(seconds=2.5) + timedelta(seconds=0.5) + timedelta(seconds=1.173) # add 3 seconds and 1.173 seconds to get scheduled start time
+        sst = ds + timedelta(seconds=2.5) + timedelta(seconds=0.5) + timedelta(seconds=config.telescope.sto_N if self.ant == Antenna.NORTH else config.telescope.sto_S)
         self.mqtt.send_track_start_time(d2m(sst))
+        if on_run_signal:
+            on_run_signal('start_run')
+        logger.info(f"Starting tracking loop for {num_points} points ({duration_hours:.4f} hours)")
 
-        # Trigger on_track_start callback if provided
-        if on_track_start:
-            on_track_start()
+        # last_verified_position = None
+        # position_stuck_counter = 0
 
-        # Track source
-        logger.info(f"{Colors.BLUE}Starting tracking loop for {num_points} points ({duration_hours:.4f} hours){Colors.RESET}")
         for i in range(num_points):
-
-            # Check if motion stop requested
             if self.state == State.STOP:
+                if on_run_signal:
+                    on_run_signal('stop_run')
                 raise OperationError("Tracking interrupted.")
-            
-            # Get time
             ds = ds + timedelta(seconds=0.5) # sending time
             d = ds + timedelta(seconds=2.5) # sky time (calculate position 2.5 seconds ahead)
             rt = i * 0.5 # relative time to sst
-
-            # Get azel with detailed logging for first few points
-            if i < 3:  # Log details for first 3 points
-                # Get coordinates without corrections first
-                raw_az, raw_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=False, apply_pointing_model=False, clip=False)
-                logger.info(f"Point {i+1} raw coordinates: AZ={raw_az:.4f}°, EL={raw_el:.4f}°")
-                
-                # Get coordinates with corrections but no pointing model
-                corr_az, corr_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=False, clip=False)
-                logger.info(f"Point {i+1} with corrections: AZ={corr_az:.4f}°, EL={corr_el:.4f}°")
-                
-                # Get final coordinates with everything applied
-                mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
-                logger.info(f"Point {i+1} final coordinates: AZ={mnt_az:.4f}°, EL={mnt_el:.4f}°")
-            else:
-                # Get final coordinates for remaining points
-                mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
-            
-            # Send position command
+            mnt_az, mnt_el = self.pointing.radec2azel(source, self.ant, d, apply_corrections=True, apply_pointing_model=True, clip=True)
             self.mqtt.send_track_position(rt, mnt_az, mnt_el, ds)
-            
-            # Update progress
             percent = (i + 1) / num_points * 100.0
-            if progress_callback and (i + 1) % 10 == 0:  # Update every 10 points (5 seconds)
+            if progress_callback and (i + 1) % 10 == 0:
                 progress_info = ProgressInfo(
                     operation_type=OperationType.TRACK,
                     antenna=self.ant,
@@ -833,19 +717,26 @@ class Tracker:
                     message=f"Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s"
                 )
                 progress_callback(progress_info)
-            
-            # Log progress every 10 points (5 seconds)
             if (i + 1) % 10 == 0:
-                logger.info(f"{Colors.BLUE}Track progress: Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s{Colors.RESET}")
+                logger.info(f"Track progress: Point {i+1}/{num_points} - AZ={mnt_az:.2f}°, EL={mnt_el:.2f}°, time={rt:.1f}s")
 
-        # Trigger on_track_stop callback if provided
-        if on_track_stop:
-            on_track_stop()
+            # current_pos = self.mqtt.get_current_position()
+            # if last_verified_position and current_pos:
+            #     if (abs(current_pos[0] - last_verified_position[0]) < 0.01 and 
+            #         abs(current_pos[1] - last_verified_position[1]) < 0.01):
+            #         position_stuck_counter += 1
+            #         if position_stuck_counter > 120: 
+            #             raise OperationError(f"ANTENNA {self.ant} APPEARS TO BE STUCK AT AZ={current_pos[0]:.2f}°, EL={current_pos[1]:.2f}°")
+            #     else:
+            #         position_stuck_counter = 0
+            # last_verified_position = current_pos
+            
+        if on_run_signal:
+            on_run_signal('stop_run')
 
-        # Log final progress
-        logger.info(f"{Colors.GREEN}Track completed: {num_points} points processed{Colors.RESET}")
-        
-        # Send completion progress
+        sleep(3)
+
+        logger.info(f"Track completed: {num_points} points processed")
         if progress_callback:
             progress_info = ProgressInfo(
                 operation_type=OperationType.TRACK,
@@ -855,9 +746,7 @@ class Tracker:
                 is_complete=True
             )
             progress_callback(progress_info)
-        
-        # Stop tracking
-        logger.info(f"{Colors.RED}Stopping tracking{Colors.RESET}")
+        logger.info(f"Stopping tracking")
         self.mqtt.set_axis_mode_stop()
         self.state = State.IDLE
         return True
@@ -898,16 +787,16 @@ class Tracker:
         logger.info(f"Position difference: ΔAZ={target_az-curr_az:.2f}°, ΔEL={target_el-curr_el:.2f}°")
 
         # Get safe path
-        logger.info(f"{Colors.BLUE}Calculating safe path...{Colors.RESET}")
+        logger.info(f"Calculating safe path...")
         az_list, el_list = self.safety_checker.get_safe_path(curr_az, curr_el, target_az, target_el)
         
         # Check if direct path was taken or if we need a detour
         if len(az_list) == 1:
-            logger.info(f"{Colors.GREEN}Direct path is safe - proceeding with single step{Colors.RESET}")
+            logger.info(f"Direct path is safe - proceeding with single step")
         else:
             logger.info(f"Multi-step path required: {len(az_list)} waypoints")
             # Print the path and safety information
-            self.safety_checker._show_path([curr_az] + az_list, [curr_el] + el_list)
+            self.safety_checker.log_path([curr_az] + az_list, [curr_el] + el_list, logger)
         
         # Slew to target
         self.state = State.SLEWING
@@ -924,7 +813,7 @@ class Tracker:
             self.mqtt.set_axis_mode_position(mnt_az, mnt_el)
 
             # Wait for slewing to complete with progress callback or print
-            logger.info(f"{Colors.BLUE}Waiting for axes to reach position...{Colors.RESET}")
+            logger.info(f"Waiting for axes to reach position...")
             az_mode, el_mode = self.mqtt.get_current_mode()
             while az_mode == "position" or el_mode == "position":
                 sleep(0.5)
@@ -942,15 +831,15 @@ class Tracker:
                 else:
                     # Log slewing progress every slew_progress_update_interval seconds (configurable)
                     if hasattr(self, '_last_slew_log_time'):
-                        if time.time() - self._last_slew_log_time >= config.telescope.slew_progress_update_interval:
-                            logger.info(f"{Colors.BLUE}Slewing progress: Step {i+1}/{len(az_list)} - AZ → {mnt_az:.2f}°, EL → {mnt_el:.2f}°{Colors.RESET}")
-                            self._last_slew_log_time = time.time()
+                        if time() - self._last_slew_log_time >= config.telescope.slew_progress_update_interval:
+                            logger.info(f"Slewing progress: Step {i+1}/{len(az_list)} - AZ → {mnt_az:.2f}°, EL → {mnt_el:.2f}°")
+                            self._last_slew_log_time = time()
                     else:
-                        self._last_slew_log_time = time.time()
-                        logger.info(f"{Colors.BLUE}Slewing progress: Step {i+1}/{len(az_list)} - AZ → {mnt_az:.2f}°, EL → {mnt_el:.2f}°{Colors.RESET}")
+                        self._last_slew_log_time = time()
+                        logger.info(f"Slewing progress: Step {i+1}/{len(az_list)} - AZ → {mnt_az:.2f}°, EL → {mnt_el:.2f}°")
         
         # Stop slewing
-        logger.info(f"{Colors.RED}Stopping axes{Colors.RESET}")
+        logger.info(f"Stopping axes")
         self.mqtt.set_axis_mode_stop()
         self.state = State.IDLE
         
@@ -958,7 +847,7 @@ class Tracker:
         final_az, final_el = self.mqtt.get_current_position()
         if final_az is not None and final_el is not None:
             offset = angular_separation(final_az, final_el, target_az, target_el)
-            logger.info(f"{Colors.GREEN}Final position: AZ={final_az:.2f}°, EL={final_el:.2f}° (offset: {offset:.2f}°){Colors.RESET}")
+            logger.info(f"Final position: AZ={final_az:.2f}°, EL={final_el:.2f}° (offset: {offset:.2f}°)")
         
         # Send completion progress
         if progress_callback:

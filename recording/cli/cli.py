@@ -5,7 +5,6 @@ import argparse
 import sys
 import signal
 import logging
-from typing import Optional
 from ..core import Recorder
 from ..utils.exceptions import RecordingError, ConfigurationError, DeviceConnectionError, DeviceInitializationError, DataCollectionError, DataSaveError, InvalidParameterError, DirectoryError, StateError
 from ..utils.colors import Colors
@@ -25,16 +24,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Data recording tool for DSA RFSoC4x2 device",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s --duration 60                    # Record for 60 seconds
-  %(prog)s --name "test_observation"        # Record continuously with custom name
-  %(prog)s --fftshift 1000 --acclen 65536  # Set FPGA parameters and record continuously
-  %(prog)s --status                         # Show device status only
-  %(prog)s                                  # Start continuous recording (default behavior)
-        """
     )
     
+    # Global logging options
+    parser.add_argument('--verbose', action='store_true', help='Enable debug logging')
+    parser.add_argument('--quiet', action='store_true', help='Only show errors')
+
     # Recording options
     parser.add_argument(
         '--name', '-n',
@@ -77,11 +72,20 @@ Examples:
     )
     
     args = parser.parse_args()
+
+    # Configure logging
+    if args.quiet:
+        logging.basicConfig(level=logging.ERROR, format='[%(levelname)s] %(message)s')
+    elif args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
+    else:
+        logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     
     # Set up signal handling
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    recorder = None
     try:
         # Initialize recorder
         recorder = Recorder()
@@ -104,8 +108,8 @@ Examples:
         
         # Configure device parameters
         if args.fftshift is not None:
-            logger.info(f"Setting FFT shift to {args.fftshift}")
-            recorder.set_fftshift(args.fftshift)
+            logger.info(f"Setting FFT shift to {args.fftshift} (both polarizations)")
+            recorder.set_fftshift(args.fftshift, args.fftshift)
         
         if args.acclen is not None:
             logger.info(f"Setting accumulation length to {args.acclen}")
@@ -154,6 +158,12 @@ Examples:
             import traceback
             traceback.print_exc()
         return 1
+    finally:
+        if recorder is not None:
+            try:
+                recorder.cleanup()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

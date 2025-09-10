@@ -5,13 +5,16 @@ import sys
 from PyQt5.QtWidgets import QApplication
 
 from gui.main_window import MainWindow
+from core.logging import setup_logging
 
 def main():
     """Main application entry point."""
+    log_queue = setup_logging()
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
-    window = MainWindow()
+    window = MainWindow(log_queue=log_queue)
     window.show()
     
     sys.exit(app.exec_())

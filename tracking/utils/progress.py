@@ -1,10 +1,11 @@
 """
-progress.py - Progress callback interfaces for tracking operations
+Progress callback interfaces for tracking operations
 """
+
 from typing import Optional, Callable, Union
 from dataclasses import dataclass
 from enum import Enum
-
+from tracking.utils.antenna import Antenna, antenna_letter
 
 class OperationType(Enum):
     """Types of tracking operations."""
@@ -14,17 +15,24 @@ class OperationType(Enum):
     RASTA_SCAN = "rasta_scan"
     POINTING_OFFSETS = "pointing_offsets"
 
-
 @dataclass
 class ProgressInfo:
-    """Progress information for tracking operations."""
+    """Progress information for tracking operations.
+
+    Attributes:
+        operation_type: Operation enum for the current action
+        antenna: Antenna enum for the antenna
+        percent_complete: Progress percent [0-100]
+        message: Human-readable status message
+        is_complete: True if operation completed
+        error: Error message if present
+    """
     operation_type: OperationType
-    antenna: str
+    antenna: Antenna
     percent_complete: float = 0.0
     message: str = ""
     is_complete: bool = False
     error: Optional[str] = None
-
 
 class ProgressCallback:
     """Base class for progress callbacks."""
@@ -35,25 +43,33 @@ class ProgressCallback:
 
 
 class LoggingProgressCallback(ProgressCallback):
-    """Progress callback that logs to the standard logger."""
+    """Progress callback that logs to the standard logger.
+
+    Args:
+        logger: A logging.Logger instance to use for output
+    """
     
     def __init__(self, logger):
         self.logger = logger
     
     def __call__(self, progress_info: ProgressInfo) -> None:
         """Log progress information."""
+        ant_code = antenna_letter(progress_info.antenna)
         if progress_info.error:
-            self.logger.error(f"{progress_info.antenna} {progress_info.operation_type.value}: {progress_info.error}")
+            self.logger.error(f"{ant_code} {progress_info.operation_type.value}: {progress_info.error}")
         elif progress_info.is_complete:
-            self.logger.info(f"{progress_info.antenna} {progress_info.operation_type.value}: Complete")
+            self.logger.info(f"{ant_code} {progress_info.operation_type.value}: Complete")
         else:
-            self.logger.info(f"{progress_info.antenna} {progress_info.operation_type.value}: {progress_info.percent_complete:.1f}% - {progress_info.message}")
-
+            self.logger.info(f"{ant_code} {progress_info.operation_type.value}: {progress_info.percent_complete:.1f}% - {progress_info.message}")
 
 class SimpleProgressCallback(ProgressCallback):
-    """Simple progress callback that calls a function with percent and message."""
+    """Simple progress callback that calls a function with percent and message.
+
+    Args:
+        callback_func: Callable of the form (antenna: Antenna, percent: float, message: str) -> None
+    """
     
-    def __init__(self, callback_func: Callable[[str, float, str], None]):
+    def __init__(self, callback_func: Callable[[Antenna, float, str], None]):
         self.callback_func = callback_func
     
     def __call__(self, progress_info: ProgressInfo) -> None:
@@ -61,10 +77,8 @@ class SimpleProgressCallback(ProgressCallback):
         if not progress_info.is_complete and not progress_info.error:
             self.callback_func(progress_info.antenna, progress_info.percent_complete, progress_info.message)
 
-
 def create_progress_callback(callback_type: str = "logging", **kwargs) -> Optional[ProgressCallback]:
-    """
-    Create a progress callback based on the specified type.
+    """Create a progress callback based on the specified type.
     
     Args:
         callback_type: Type of callback ("logging", "simple", or None)

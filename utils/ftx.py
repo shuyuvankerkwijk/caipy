@@ -26,7 +26,6 @@ class Antenna(Enum):
     NORTH = "N"
     SOUTH = "S"
 
-
 @dataclass
 class FTXMonitorData:
     """Data structure for FTX monitoring data."""

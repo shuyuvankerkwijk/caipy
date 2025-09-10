@@ -1,8 +1,5 @@
 """
-Centralized color definitions for the tracking package.
-
-This module provides ANSI color codes for consistent terminal output formatting
-across all tracking package modules.
+Centralized color definitions.
 """
 
 class Colors:

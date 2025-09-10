@@ -1,6 +1,7 @@
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QGroupBox, QHBoxLayout, QDoubleSpinBox, QCheckBox, QPushButton, QComboBox
 from PyQt5.QtCore import QTimer
 from utils.ftx import FTXController, Antenna
+from typing import Dict, Any, Optional
 
 class FTXPanel(QWidget):
     def __init__(self, parent=None):
@@ -122,3 +123,61 @@ class FTXPanel(QWidget):
         except Exception as e:
             # Optionally show error in UI
             pass 
+
+    def get_all_ftx_parameters(self) -> Dict[str, Any]:
+        """
+        Query all FTX parameters (attenuation, RF power, and laser current) 
+        for all four FTX units (Y(N), X(N), Y(S), X(S)).
+        
+        Returns:
+            Dictionary containing FTX parameters for all units, with structure:
+            {
+                'ftx_yn_attenuation_db': float,
+                'ftx_yn_rf_power_dbm': float,
+                'ftx_yn_laser_current_ma': float,
+                'ftx_xn_attenuation_db': float,
+                'ftx_xn_rf_power_dbm': float,
+                'ftx_xn_laser_current_ma': float,
+                'ftx_ys_attenuation_db': float,
+                'ftx_ys_rf_power_dbm': float,
+                'ftx_ys_laser_current_ma': float,
+                'ftx_xs_attenuation_db': float,
+                'ftx_xs_rf_power_dbm': float,
+                'ftx_xs_laser_current_ma': float,
+                'ftx_query_timestamp': str
+            }
+            
+            If any FTX unit fails to respond, its values will be None.
+        """
+        import time
+        from datetime import datetime
+        
+        ftx_params = {}
+        ftx_units = {
+            'yn': (Antenna.NORTH, 0),  # Y(N)
+            'xn': (Antenna.NORTH, 1),  # X(N)
+            'ys': (Antenna.SOUTH, 0),  # Y(S)
+            'xs': (Antenna.SOUTH, 1),  # X(S)
+        }
+        
+        for unit_name, (ant, pol) in ftx_units.items():
+            try:
+                ctrl = self.controllers[(ant, pol)]
+                data = ctrl.get_monitor_data(pol)
+                
+                # Store the three key parameters
+                ftx_params[f'ftx_{unit_name}_attenuation_db'] = data.attenuation_db
+                ftx_params[f'ftx_{unit_name}_rf_power_dbm'] = data.rf_power_dbm
+                ftx_params[f'ftx_{unit_name}_laser_current_ma'] = data.ld_current_ma
+                
+            except Exception as e:
+                # If any FTX unit fails, set its values to None
+                ftx_params[f'ftx_{unit_name}_attenuation_db'] = None
+                ftx_params[f'ftx_{unit_name}_rf_power_dbm'] = None
+                ftx_params[f'ftx_{unit_name}_laser_current_ma'] = None
+                print(f"Warning: Failed to query {unit_name.upper()} FTX parameters: {e}")
+        
+        # Add timestamp
+        ftx_params['ftx_query_timestamp'] = datetime.now().isoformat()
+        
+        return ftx_params 

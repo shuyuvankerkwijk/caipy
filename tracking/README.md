@@ -8,13 +8,14 @@ Based on the Tracker.m MATLAB code by S. Padin (5/12/25)
 
 ```python
 from tracking import Tracker, Source
+from tracking.utils.antenna import Antenna
 
 # Create tracker and source
 tracker = Tracker()
 source = Source(ra_hrs=12.0, dec_deg=45.0)
 
 # Complete tracking operation (slew, track, park)
-success = tracker.run_track(ant="N", source=source, duration_hours=1.0)
+success = tracker.run_track(ant=Antenna.NORTH, source=source, duration_hours=1.0)
 ```
 
 ## API Reference
@@ -27,7 +28,7 @@ success = tracker.run_track(ant="N", source=source, duration_hours=1.0)
 Complete tracking operation with optional slewing and parking.
 
 **Parameters:**
-- `ant` (str): Antenna identifier ("N" or "S")
+- `ant` (Antenna): Antenna enum (`Antenna.NORTH` or `Antenna.SOUTH`)
 - `source` (Source): Source object with coordinates
 - `duration_hours` (float): Duration to track in hours
 - `slew` (bool): Whether to slew to target before tracking (default: True)
@@ -40,7 +41,7 @@ Complete tracking operation with optional slewing and parking.
 Slew to a target position. Can use either RA/Dec coordinates (via source) or Az/El coordinates directly.
 
 **Parameters:**
-- `ant` (str): Antenna identifier ("N" or "S")
+- `ant` (Antenna): Antenna enum (`Antenna.NORTH` or `Antenna.SOUTH`)
 - `source` (Source, optional): Source object with RA/Dec coordinates
 - `az` (float, optional): Azimuth in degrees (use with el for Az/El mode)
 - `el` (float, optional): Elevation in degrees (use with az for Az/El mode)
@@ -54,7 +55,7 @@ Slew to a target position. Can use either RA/Dec coordinates (via source) or Az/
 Park the telescope to the configured park position.
 
 **Parameters:**
-- `ant` (str): Antenna identifier ("N" or "S")
+- `ant` (Antenna): Antenna enum (`Antenna.NORTH` or `Antenna.SOUTH`)
 - `progress_callback` (ProgressCallback or callable): Optional callback for detailed progress updates
 
 **Returns:** bool - True if successful, False otherwise
@@ -63,13 +64,14 @@ Park the telescope to the configured park position.
 
 ```python
 from tracking.utils.progress import create_progress_callback, LoggingProgressCallback
+from tracking.utils.antenna import Antenna
 
 # Logging callback (default)
 logging_callback = create_progress_callback("logging")
 
-# Simple callback
-def my_callback(antenna, percent, message):
-    print(f"{antenna}: {percent}% - {message}")
+# Simple callback (antenna is an Antenna enum)
+def my_callback(antenna: Antenna, percent: float, message: str):
+    print(f"{antenna.name}: {percent}% - {message}")
 
 simple_callback = create_progress_callback("simple", callback_func=my_callback)
 ```
@@ -94,9 +96,10 @@ from tracking import (
     TrackingError, SafetyError, MQTTError, ValidationError,
     ConfigurationError, OperationError, TimeoutError
 )
+from tracking.utils.antenna import Antenna
 
 try:
-    success = tracker.run_track(ant="N", source=source, duration_hours=1.0)
+    success = tracker.run_track(ant=Antenna.NORTH, source=source, duration_hours=1.0)
 except SafetyError as e:
     print(f"Safety violation: {e}")
 except MQTTError as e:
@@ -182,6 +185,7 @@ python -m tracking.cli.cli park -ant N
 
 ```python
 from tracking import Tracker, Source
+from tracking.utils.antenna import Antenna
 
 tracker = Tracker()
 
@@ -197,7 +201,7 @@ source = Source(
 
 # Complete tracking operation
 success = tracker.run_track(
-    ant="N",
+    ant=Antenna.NORTH,
     source=source,
     duration_hours=2.0,
     slew=True,
@@ -205,13 +209,13 @@ success = tracker.run_track(
 )
 
 # Slew to RA/Dec coordinates
-success = tracker.run_slew(ant="N", source=source)
+success = tracker.run_slew(ant=Antenna.NORTH, source=source)
 
 # Slew to Az/El coordinates directly
-success = tracker.run_slew(ant="S", az=180.0, el=45.0)
+success = tracker.run_slew(ant=Antenna.SOUTH, az=180.0, el=45.0)
 
 # Park telescope
-success = tracker.run_park(ant="N")
+success = tracker.run_park(ant=Antenna.NORTH)
 ```
 
 ### Command Line Examples

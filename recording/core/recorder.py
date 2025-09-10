@@ -174,7 +174,8 @@ class Recorder:
                 raise ValueError(f"Invalid antenna: {ant}")
             
             # Create MQTT client
-            client_id = f"recorder_position_{ant}_{int(time.time())}"
+            import uuid
+            client_id = f"recorder_position_{ant}_{uuid.uuid4().hex[:8]}"
             client = mqtt.Client(client_id=client_id)
             
             # Set up callbacks
@@ -392,16 +393,28 @@ class Recorder:
         """Get the current wait time between data collections."""
         return self._waittime
 
-    def set_fftshift(self, fftshift: int) -> None:
-        """Set the FFT shift value for both polarizations."""
-        if not config.device.fftshift_min <= fftshift <= config.device.fftshift_max:
-            raise InvalidParameterError(
-                f"FFT shift must be between {config.device.fftshift_min} and {config.device.fftshift_max}"
-            )
+    def set_fftshift(self, fftshift_p0: int = None, fftshift_p1: int = None) -> None:
+        """Set the FFT shift values for P0 and P1 polarizations.
+        
+        Args:
+            fftshift_p0: FFT shift value for P0 polarization
+            fftshift_p1: FFT shift value for P1 polarization (defaults to fftshift_p0 if None)
+        """
+        # Must provide both values
+        if fftshift_p1 is None or fftshift_p0 is None:
+            raise InvalidParameterError("Both FFT shift values must be provided")
+            
+        # Validate both values
+        for pol, value in [("P0", fftshift_p0), ("P1", fftshift_p1)]:
+            if not config.device.fftshift_min <= value <= config.device.fftshift_max:
+                raise InvalidParameterError(
+                    f"{pol} FFT shift must be between {config.device.fftshift_min} and {config.device.fftshift_max}"
+                )
         
         try:
-            self._device.p0_pfb_nc.set_fft_shift(fftshift)
-            self._device.p1_pfb_nc.set_fft_shift(fftshift)
+            self._device.p0_pfb_nc.set_fft_shift(fftshift_p0)
+            self._device.p1_pfb_nc.set_fft_shift(fftshift_p1)
+            logger.info(f"Set FFT shift: P0={fftshift_p0}, P1={fftshift_p1}")
         except Exception as e:
             raise DataCollectionError(f"Failed to set FFT shift: {e}")
 
@@ -430,26 +443,19 @@ class Recorder:
         duration_seconds: Optional[int] = None,
         progress_callback: Optional["ProgressCallback"] = None,
     ) -> bool:
-        """
-        Start recording data.
-        
-        Args:
-            duration_seconds: Optional duration limit in seconds (None for continuous recording)
-            progress_callback: Optional callback to report progress
-        
-        Returns:
-            True if recording completed successfully, False if interrupted
-        
-        Raises:
-            StateError: If already recording
-            DirectoryError: If directory creation fails
-            DataCollectionError: If data collection fails
-        """
+        """Start recording data with an optional time limit."""
+        # If a recording is already running, bail out early – do NOT touch the
+        # current save directory or any other state.
         if self._is_recording:
-            raise StateError("Already recording. Stop current recording first.")
-        
-        # Setup save directory using external observation name
+            logger.warning("Recording is already in progress – call stop_recording() first")
+            return False
+
+        # Always create a fresh save directory for every new recording attempt.
+        # This avoids re-using an old directory if observation_name has changed.
+        self._save_dir = None
         self._setup_save_directory()
+
+        logger.info(f"Starting recording (observation_name={self._observation_name}, save_dir={self._save_dir})")
 
         # Save metadata file with run and recorder settings
         self._save_metadata_file(duration_seconds)
@@ -470,76 +476,94 @@ class Recorder:
         return self._recording_loop(duration_seconds, progress_callback)
 
     def stop_recording(self) -> None:
-        """Stop the current recording session."""
         if not self._is_recording:
-            logger.info("Not currently recording.")
+            logger.info("Cannot stop recording -- not currently recording.")
             return
-        
         self._is_recording = False
         self._interrupted = True
+        logger.info(f"Recording stopped (observation_name={self._observation_name}, save_dir={self._save_dir})")
         logger.info(f"{Colors.RED}Recording stopped{Colors.RESET}")
 
     # ============================================================================
     # POINT RECORDING METHODS
     # ============================================================================
     
-    def start_point_recording(self, source_idx: int) -> None:
+    def start_point_recording(self, source_idx: int, format_dict: dict = None) -> None:
         """
-        Called when a point starts to record the current line position.
+        Called when a point starts to record the current line position and immediately writes to point_ranges.txt with 'inf' as the end line.
         
         Args:
-            source_idx: The index of the scan point
-        """
-        if not self.is_recording:
-            logger.warning("Cannot start point recording: recording is not active.")
-            return
-        
-        # Only set start line if not already set (to avoid overwriting)
-        if source_idx not in self._point_start_lines:
-            self._point_start_lines[source_idx] = self._current_line_position
-            logger.info(f"Started tracking point {source_idx} at line {self._current_line_position}")
-        else:
-            logger.info(f"Point {source_idx} already has start line set to {self._point_start_lines[source_idx]}")
-
-    def log_point_to_file(self, source_ra: float, source_dec: float, source_idx: int, antenna: str = None) -> None:
-        """
-        Log the completion of a scan point to point_ranges.txt.
-        
-        Args:
-            source_ra: Right Ascension of the scan point
-            source_dec: Declination of the scan point  
-            source_idx: The index of the scan point
-            antenna: Antenna identifier ("N" or "S")
+            source_idx: Unique identifier for the point
+            format_dict: Dictionary containing key-value pairs to log. All keys and values will be written to the log line.
         """
         if not self.is_recording or not self._save_dir:
-            logger.warning("Cannot log point completion: recording is not active or save directory is not set.")
+            logger.warning("Cannot start point recording: recording is not active or save directory is not set.")
             return
-
+        if source_idx in self._point_start_lines:
+            logger.info(f"Point {source_idx} already has start line set to {self._point_start_lines[source_idx]}")
+            return
+        self._point_start_lines[source_idx] = self._current_line_position
         log_file_path = os.path.join(self._save_dir, "point_ranges.txt")
         
+        if format_dict is None:
+            format_dict = {}
+        
+        # Always start with p{source_idx}
+        log_parts = [f"p{source_idx}"]
+        
+        # Add all key-value pairs from the dictionary
+        for key, value in format_dict.items():
+            if isinstance(value, float):
+                log_parts.append(f"{key} {value:.2f}")
+            else:
+                log_parts.append(f"{key} {value}")
+        
+        # Add line numbers
+        log_parts.append(f"lines {self._current_line_position}-inf")
+        
+        log_line = ", ".join(log_parts) + "\n"
+        
+        with open(log_file_path, "a") as f:
+            f.write(log_line)
+        logger.info(f"Started tracking point {source_idx} at line {self._current_line_position}")
+
+    def stop_point_recording(self, source_idx: int) -> None:
+        """
+        Called when a point ends to update the corresponding line in point_ranges.txt, replacing 'inf' with the actual end line.
+        
+        Args:
+            source_idx: Unique identifier for the point
+        """
+        if not self.is_recording or not self._save_dir:
+            logger.warning("Cannot stop point recording: recording is not active or save directory is not set.")
+            return
+        log_file_path = os.path.join(self._save_dir, "point_ranges.txt")
+        end_line = self._current_line_position - 1
+        
+        # Read all lines, update the relevant one
         try:
-            current_time = time.time()
-            start_line = self._point_start_lines.get(source_idx, 0)
-            end_line = self._current_line_position - 1  # Last line written (inclusive end)
+            with open(log_file_path, "r") as f:
+                lines = f.readlines()
+            updated = False
             
-            log_line = (
-                f"p{source_idx}{antenna}, "
-                f"ra {source_ra:.6f}, dec {source_dec:.6f}, "
-                f"timestamp {current_time:.6f}, lines {start_line}-{end_line}\n"
-            )
+            # Always match p{source_idx} pattern
+            pattern = f"p{source_idx}"
             
-            with open(log_file_path, "a") as f:
-                f.write(log_line)
-                
-            logger.info(f"Logged point {source_idx}{antenna} to {log_file_path} (lines {start_line}-{end_line})")
-            
-            # Set the start line for the next point to ensure sequential ranges
-            next_source_idx = source_idx + 1
-            self._point_start_lines[next_source_idx] = self._current_line_position
-            logger.info(f"Set start line for next point {next_source_idx} to {self._current_line_position}")
-            
+            for i, line in enumerate(lines):
+                if line.startswith(pattern) and line.strip().endswith("-inf"):
+                    # Replace 'inf' with the actual end line
+                    lines[i] = line.replace("-inf", f"-{end_line}")
+                    updated = True
+                    break
+                    
+            if updated:
+                with open(log_file_path, "w") as f:
+                    f.writelines(lines)
+                logger.info(f"Stopped tracking point {source_idx} at line {end_line}")
+            else:
+                logger.warning(f"No matching start line found for point {source_idx} to update end line.")
         except Exception as e:
-            logger.error(f"Failed to log point completion to {log_file_path}: {e}")
+            logger.error(f"Failed to update point_ranges.txt for point {source_idx}: {e}")
 
     def is_recording_active(self) -> bool:
         """Check if recording is currently active (for external monitoring)."""
@@ -643,23 +667,18 @@ class Recorder:
             raise DeviceInitializationError(f"Failed to initialize device parameters: {e}")
 
     def _setup_save_directory(self) -> None:
-        """Setup the save directory for recording."""
         try:
             base_dir = str(config.recording.base_directory)
             run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            
-            # Use external observation name if set, otherwise use default
             if self._observation_name:
                 save_dir = os.path.join(base_dir, f'{self._observation_name}_{run_timestamp}')
             else:
                 save_dir = os.path.join(base_dir, f'observation_{run_timestamp}')
-            
             os.makedirs(save_dir, exist_ok=True)
             self._save_dir = save_dir
             logger.info(f"Created new save directory: {self._save_dir}")
         except Exception as e:
             raise DirectoryError(f"Failed to create save directory: {e}")
-
         logger.info(f"Saving to: {self._save_dir}")
 
     def _save_metadata_file(self, duration_seconds: Optional[int]) -> None:
@@ -737,8 +756,14 @@ class Recorder:
             while True:
                 # Check if interrupted
                 if self._interrupted:
-                    logger.warning(f"{Colors.RED}Recording interrupted by user{Colors.RESET}")
-                    return False
+                    if duration_seconds is None:
+                        # For continuous recordings, user interruption is successful completion
+                        logger.info(f"{Colors.GREEN}Continuous recording stopped by user{Colors.RESET}")
+                        return True
+                    else:
+                        # For timed recordings, user interruption is a failure
+                        logger.warning(f"{Colors.RED}Timed recording interrupted by user{Colors.RESET}")
+                        return False
                 
                 # Check if duration_seconds is set and time is up
                 if duration_seconds is not None:

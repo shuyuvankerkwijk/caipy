@@ -1,16 +1,20 @@
-import math
+"""
+Astronomy conversions and pointing model application. 
+Provides RA/Dec to Az/El conversion with optional sky-offset corrections and an 11-parameter pointing model per antenna.
+"""
+
 import numpy as np
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from astropy.time import Time
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_sun
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 import astropy.units as u
 from typing import Optional
 import logging
-
 from tracking.utils.config import config
 from tracking.utils.source import Source
 from tracking.utils.helpers import xel2az
 from tracking.utils.colors import Colors
+from tracking.utils.antenna import Antenna, parse_antenna
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -21,8 +25,8 @@ class AstroPointing:
         Pointing model object for a given antenna and source location.
 
         Args:
-            ant (str): Antenna name, in ["N", "S"]
-            location (EarthLocation): Observatory location
+            location_n (EarthLocation): Observatory location for North antenna
+            location_s (EarthLocation): Observatory location for South antenna
             temp_C (float): Temperature in Celsius
             pressure (float): Pressure in millibars
             rh (float): Relative humidity in %
@@ -41,7 +45,7 @@ class AstroPointing:
         self.n_ppar = n_ppar or config.telescope.n_ppar
         self.s_ppar = s_ppar or config.telescope.s_ppar
 
-    def radec2azel(self, source : Source, ant : str, obs_datetime : datetime = None, apply_corrections : bool = True, apply_pointing_model : bool = True, clip : bool = True) -> tuple[float, float]:
+    def radec2azel(self, source : Source, ant, obs_datetime : datetime = None, apply_corrections : bool = True, apply_pointing_model : bool = True, clip : bool = True) -> tuple[float, float]:
         """
         Calculate star position in horizontal coordinates using Astropy.
         
@@ -50,20 +54,21 @@ class AstroPointing:
         atmospheric refraction corrections.
         
         Args:
-            ra_hrs (float): Right ascension in hours
-            dec_deg (float): Declination in degrees
-            pm_ra (float): Proper motion in RA in mas/yr
-            pm_dec (float): Proper motion in Dec in mas/yr
-            plx (float): Parallax in mas
-            radvel (float): Radial velocity in km/s
-            obs_datetime (datetime): Observation time (must be timezone-aware, UTC)
+            source (Source): Source object containing RA (hours), Dec (deg), proper motion, parallax, and radial velocity.
+            ant (Antenna): Antenna enum.
+            obs_datetime (datetime, optional): Observation time (must be timezone-aware, UTC).
+            apply_corrections (bool, optional): Whether to apply sky offset corrections (default: True).
+            apply_pointing_model (bool, optional): Whether to apply the pointing model (default: True).
+            clip (bool, optional): Whether to clip elevation to allowed range (default: True).
+
         Returns:
             tuple: (azimuth_deg, elevation_deg)
         """
         # Select per-antenna location
-        if ant == "N":
+        ant_enum = parse_antenna(ant)
+        if ant_enum == Antenna.NORTH:
             obs_location = self.location_n
-        elif ant == "S":
+        elif ant_enum == Antenna.SOUTH:
             obs_location = self.location_s
         else:
             raise ValueError(f"Invalid antenna: {ant}")
@@ -125,20 +130,14 @@ class AstroPointing:
         Apply pointing model to convert ideal topocentric coordinates to mount coordinates.
         Applies an 11-parameter pointing model that accounts for various mechanical
         imperfections in the telescope mount.
-        [0] - flexure sin
-        [1] - flexure cos
-        [2] - az tilt y (ha)
-        [3] - az tilt x (lat)
-        [4] - el tilt
-        [5] - collimation x (cross-el)
-        [6] - collimation y (el) same as en encdr zero
-        [7] - encdr zero az
-        [8] - encdr zero el
-        [9] - az sin
-        [10] - az cos
+        
+        Parameter order:
+        [0] flexure sin, [1] flexure cos, [2] az tilt y (ha), [3] az tilt x (lat),
+        [4] el tilt, [5] collimation x (cross-el), [6] collimation y (el),
+        [7] encdr zero az, [8] encdr zero el, [9] az sin, [10] az cos
         
         Args:
-            self.model (list): 11-element list of pointing model parameters in degrees
+            ant (str): Antenna identifier ("N" or "S")
             ide_az (float): Ideal azimuth in degrees
             ide_el (float): Ideal elevation in degrees
             
@@ -146,9 +145,10 @@ class AstroPointing:
             tuple: (mount_az, mount_el) - Mount coordinates in degrees
         """ 
         # Select per-antenna pointing model
-        if ant == "N":
+        ant_enum = parse_antenna(ant)
+        if ant_enum == Antenna.NORTH:
             ppar = self.n_ppar
-        elif ant == "S":
+        elif ant_enum == Antenna.SOUTH:
             ppar = self.s_ppar
         else:
             raise ValueError(f"Invalid antenna: {ant}")

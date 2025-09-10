@@ -1,11 +1,7 @@
 """
 Astronomical source representation.
-
-This module provides the Source class for representing celestial objects
-with their coordinates and proper motion parameters.
 """
 
-from typing import Optional
 from dataclasses import dataclass
 from .exceptions import ValidationError
 

@@ -1,6 +1,7 @@
 """
-mqtt_controller.py - MQTT communication for telescope control
+MQTT communication for telescope control
 """
+
 import os
 import json
 import time
@@ -9,6 +10,7 @@ import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
 from tracking.utils.config import config
 from tracking.utils.colors import Colors
+from tracking.utils.antenna import Antenna, antenna_letter, parse_antenna
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -78,7 +80,6 @@ class MqttController:
             # Parse JSON message and store it
             data = json.loads(msg.payload.decode())
             self.messages[msg.topic] = data
-            logger.debug(f"Received message on {msg.topic}: {data}")
         except json.JSONDecodeError as e:
             logger.warning(f"{Colors.RED}Failed to parse MQTT message: {e}{Colors.RESET}")
         except Exception as e:
@@ -101,21 +102,21 @@ class MqttController:
         if port is None:
             port = config.mqtt.port
 
-        if ant not in ["N", "S"]:
-            raise ValueError(f"Invalid antenna '{ant}'. Must be 'N' or 'S'.")
+        # Normalize to enum and short letter
+        ant_enum = parse_antenna(ant)
+        ant_code = antenna_letter(ant_enum)
+        self.ant = ant_code
 
-        self.ant = ant
-
-        if ant == "N":
+        if ant_enum == Antenna.NORTH:
             broker_ip = config.mqtt.north_broker_ip
-        elif ant == "S":
+        elif ant_enum == Antenna.SOUTH:
             broker_ip = config.mqtt.south_broker_ip
         else:
             raise ValueError("How did tis happen?")
 
         # Create unique client ID to avoid conflicts
         import uuid
-        unique_client_id = f"{config.mqtt.client_id}_{ant}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+        unique_client_id = f"{config.mqtt.client_id}_{ant_code}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
         
         # Clean up any existing client
         if hasattr(self, 'mqtt_client') and self.mqtt_client is not None:
@@ -378,17 +379,25 @@ class MqttController:
         return False
 
     def print_status(self):
-        # AZ status - show only key info
+        # AZ status - show only key info with safe formatting
         az_status = self.read_mqtt_topic(self.topic_az_status)
         if az_status and 'v' in az_status:
             v = az_status['v']
-            logger.info(f"AZ: state={v.get('state', 'N/A')}, pos={v.get('act_pos', 'N/A'):.2f}°, target={v.get('target_pos', 'N/A'):.2f}°, in_target={v.get('in_target', 'N/A')}")
+            act_pos = v.get('act_pos')
+            tgt_pos = v.get('target_pos')
+            act_str = f"{float(act_pos):.2f}" if isinstance(act_pos, (int, float)) else str(act_pos)
+            tgt_str = f"{float(tgt_pos):.2f}" if isinstance(tgt_pos, (int, float)) else str(tgt_pos)
+            logger.info(f"AZ: state={v.get('state', 'N/A')}, pos={act_str}°, target={tgt_str}°, in_target={v.get('in_target', 'N/A')}")
             
-        # EL status - show only key info
+        # EL status - show only key info with safe formatting
         el_status = self.read_mqtt_topic(self.topic_el_status)
         if el_status and 'v' in el_status:
             v = el_status['v']
-            logger.info(f"EL: state={v.get('state', 'N/A')}, pos={v.get('act_pos', 'N/A'):.2f}°, target={v.get('target_pos', 'N/A'):.2f}°, in_target={v.get('in_target', 'N/A')}")
+            act_pos = v.get('act_pos')
+            tgt_pos = v.get('target_pos')
+            act_str = f"{float(act_pos):.2f}" if isinstance(act_pos, (int, float)) else str(act_pos)
+            tgt_str = f"{float(tgt_pos):.2f}" if isinstance(tgt_pos, (int, float)) else str(tgt_pos)
+            logger.info(f"EL: state={v.get('state', 'N/A')}, pos={act_str}°, target={tgt_str}°, in_target={v.get('in_target', 'N/A')}")
 
     def get_current_mode(self):
         """

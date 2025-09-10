@@ -7,15 +7,8 @@ import time
 from typing import Dict, Tuple, Optional, Callable
 
 from tracking import Tracker, Source
+from tracking.utils.antenna import Antenna, parse_antenna
 from recording import Recorder
-from core.bridges import (
-    UIProgressBridge,
-    RecorderStatusBridge,
-    DataBufferBridge,
-    AntennaPositionBridge,
-    TrackerCompletionBridge,
-    TrackingEventsBridge,
-)
 
 # -----------------------------------------------------------------------------
 # Helper – safe constructor for Tracker in worker threads (handles signal.signal)
@@ -42,7 +35,12 @@ def _construct_safely(factory):
 class TrackerThread(threading.Thread):
     def __init__(self, ant: str, bridge, logger_: logging.Logger):
         super().__init__(daemon=True)
-        self.ant = ant
+        # Normalize to enum immediately
+        try:
+            self.ant = parse_antenna(ant)
+        except Exception:
+            # Default to NORTH if invalid, but log will show later when used
+            self.ant = Antenna.NORTH
         self.log = logger_.getChild(f"tracker_{ant}")
         self.bridge = bridge
         self.cmd_q: queue.Queue[Tuple[str, Dict]] = queue.Queue()
@@ -67,33 +65,13 @@ class TrackerThread(threading.Thread):
             except Exception as exc:
                 pass
 
-    def _on_track_start(self, source=None, source_idx=None):
-        print(f"DEBUG: _on_track_start called with source={source}, source_idx={source_idx}")
-        self.log.info("Tracking started, emitting start event.")
-        if source is not None and source_idx is not None:
-            self.log.info(f"Emitting per-point start event for source {source_idx}: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
-            self.bridge.emit_tracking_event(self.ant, 'start_point', source=source, source_idx=source_idx)
-        else:
-            if hasattr(self, '_last_cmd') and self._last_cmd in ['rasta_scan', 'pointing_offsets']:
-                self.log.info("Emitting overall scan start event")
-                self.bridge.emit_tracking_event(self.ant, 'start_scan')
-            else:
-                self.log.info("Emitting overall start event")
-                self.bridge.emit_tracking_event(self.ant, 'start')
+    def _emit_run_signal(self, event):
+        if event == 'start_run' or event == 'stop_run':
+            self.bridge.emit_tracking_event('N' if self.ant == Antenna.NORTH else 'S', event)
 
-    def _on_track_stop(self, source=None, source_idx=None):
-        print(f"DEBUG: _on_track_stop called with source={source}, source_idx={source_idx}")
-        self.log.info("Tracking stopped, emitting stop event.")
-        if source is not None and source_idx is not None:
-            self.log.info(f"Emitting per-point stop event for source {source_idx}: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
-            self.bridge.emit_tracking_event(self.ant, 'stop_point', source=source, source_idx=source_idx)
-        else:
-            if hasattr(self, '_last_cmd') and self._last_cmd in ['rasta_scan', 'pointing_offsets']:
-                self.log.info("Emitting overall scan stop event")
-                self.bridge.emit_tracking_event(self.ant, 'stop_scan')
-            else:
-                self.log.info("Emitting overall stop event")
-                self.bridge.emit_tracking_event(self.ant, 'stop')
+    def _emit_point_signal(self, event, source, idx):
+        if event == 'start_point' or event == 'stop_point':
+            self.bridge.emit_tracking_event('N' if self.ant == Antenna.NORTH else 'S', event, source=source, source_idx=idx)
 
     def _progress_callback_with_stop_check(self, progress_info):
         if self._stop_requested:
@@ -121,6 +99,8 @@ class TrackerThread(threading.Thread):
 
             if not self.tracker:
                 self.log.warning("Tracker unavailable – ignoring %s", cmd)
+                # Still emit completion even if tracker is unavailable
+                self.bridge.emit_completion(self.ant)
                 continue
 
             self._stop_requested = False
@@ -129,86 +109,57 @@ class TrackerThread(threading.Thread):
                 self._last_cmd = cmd
                 if cmd == "slew":
                     self.tracker.run_slew(ant=self.ant, progress_callback=self._progress_callback_with_stop_check, auto_cleanup=False, **kw)
-                    self.bridge.emit_completion(self.ant)
                 elif cmd == "track":
                     self.tracker.run_track(
                         ant=self.ant,
                         progress_callback=self._progress_callback_with_stop_check,
                         auto_cleanup=False,
-                        on_track_start=self._on_track_start,
-                        on_track_stop=self._on_track_stop,
+                        on_run_signal=self._emit_run_signal,
                         **kw
                     )
-                    self.bridge.emit_completion(self.ant)
                 elif cmd == "park":
                     self.tracker.run_park(ant=self.ant, progress_callback=self._progress_callback_with_stop_check, auto_cleanup=False)
-                    self.bridge.emit_completion(self.ant)
                 elif cmd == "rasta_scan":
-                    source = kw.get('source')
-                    max_distance_deg = kw.get('max_dist_deg')
-                    steps_deg = kw.get('step_deg')
-                    position_angle_deg = kw.get('position_angle_deg')
-                    duration_hours = kw.get('duration_hours')
-                    slew = kw.get('slew', True)
-                    park = kw.get('park', True)
-                    if source is None:
-                        raise ValueError("source parameter is required")
-                    if max_distance_deg is None:
-                        raise ValueError("max_dist_deg parameter is required")
-                    if steps_deg is None:
-                        raise ValueError("step_deg parameter is required")
-                    if position_angle_deg is None:
-                        raise ValueError("position_angle_deg parameter is required")
-                    if duration_hours is None:
-                        raise ValueError("duration_hours parameter is required")
                     self.tracker.run_rasta_scan(
                         ant=self.ant,
-                        source=source,
-                        max_distance_deg=max_distance_deg,
-                        steps_deg=steps_deg,
-                        position_angle_deg=position_angle_deg,
-                        duration_hours=duration_hours,
-                        slew=slew,
-                        park=park,
                         progress_callback=self._progress_callback_with_stop_check,
                         auto_cleanup=False,
-                        on_track_start=self._on_track_start,
-                        on_track_stop=self._on_track_stop,
+                        on_run_signal=self._emit_run_signal,
+                        on_point_signal=self._emit_point_signal,
+                        **kw
                     )
-                    self.bridge.emit_completion(self.ant)
                 elif cmd == "pointing_offsets":
-                    source = kw.get('source')
-                    closest_dist_deg = kw.get('closest_dist_deg')
-                    number_of_points = kw.get('number_of_points')
-                    duration_hours = kw.get('duration_hours')
-                    slew = kw.get('slew', True)
-                    park = kw.get('park', True)
-                    if source is None or closest_dist_deg is None or number_of_points is None or duration_hours is None:
-                        raise ValueError("Missing parameters for pointing_offsets command")
                     self.tracker.run_pointing_offsets(
                         ant=self.ant,
-                        source=source,
-                        closest_distance_deg=closest_dist_deg,
-                        number_of_points=number_of_points,
-                        duration_hours=duration_hours,
-                        slew=slew,
-                        park=park,
                         progress_callback=self._progress_callback_with_stop_check,
                         auto_cleanup=False,
-                        on_track_start=self._on_track_start,
-                        on_track_stop=self._on_track_stop,
+                        on_run_signal=self._emit_run_signal,
+                        on_point_signal=self._emit_point_signal,
+                        **kw
                     )
-                    self.bridge.emit_completion(self.ant)
-                elif cmd == "stop":
-                    self.request_stop()
+                elif cmd == "rtos":
+                    self.tracker.run_rtos(
+                        ant=self.ant,
+                        progress_callback=self._progress_callback_with_stop_check,
+                        auto_cleanup=False,
+                        on_run_signal=self._emit_run_signal,
+                        on_point_signal=self._emit_point_signal,
+                        **kw
+                    )
                 else:
-                    self.log.warning("Unknown cmd %s", cmd)
-            except InterruptedError as exc:
-                self.log.info("Operation interrupted: %s", exc)
-                self.bridge.emit_completion(self.ant)
-            except Exception as exc:
-                self.log.error("Tracker %s failed: %s", cmd, exc)
-                self.bridge.emit_completion(self.ant)
+                    self.log.warning("Unknown command: %s", cmd)
+                    
+                # Always emit completion after successful command execution
+                self.bridge.emit_completion('N' if self.ant == Antenna.NORTH else 'S')
+                
+            except InterruptedError as e:
+                self.log.info(f"Operation {cmd} for antenna {'N' if self.ant == Antenna.NORTH else 'S'} was interrupted: {e}")
+                # Still emit completion when interrupted
+                self.bridge.emit_completion('N' if self.ant == Antenna.NORTH else 'S')
+            except Exception as e:
+                self.log.error(f"Error executing {cmd} for antenna {'N' if self.ant == Antenna.NORTH else 'S'}: {e}")
+                # Still emit completion when there's an error
+                self.bridge.emit_completion('N' if self.ant == Antenna.NORTH else 'S')
 
 # --- RecorderCmdThread ---
 class RecorderCmdThread(threading.Thread):
@@ -225,14 +176,19 @@ class RecorderCmdThread(threading.Thread):
     def submit(self, cmd: str, **kw):
         self.cmd_q.put((cmd, kw))
 
-    def _start_worker(self, fftshift: int, acclen: int, extra_metadata: Optional[Dict] = None):
+    def _start_worker(self, fftshift_p0: int, fftshift_p1: int, acclen: int, extra_metadata: Optional[Dict] = None):
         def _task():
+            """Worker thread that starts recording."""
             try:
-                self.recorder.set_fftshift(fftshift)
+                self.recorder.set_fftshift(fftshift_p0, fftshift_p1)
                 self.recorder.set_acclen(acclen)
                 if extra_metadata:
                     self.recorder.set_metadata(extra_metadata)
-                self.recorder.start_recording(progress_callback=self.bridge.emit_progress)
+
+                if not self._shutting_down:
+                    success = self.recorder.start_recording(progress_callback=self.bridge.emit_progress)
+                    if not success:
+                        self.log.warning("Recorder either failed to start or was interrupted")
             except Exception as exc:
                 if not self._shutting_down:
                     self.log.error("Recording task error: %s", exc)
@@ -275,30 +231,28 @@ class RecorderCmdThread(threading.Thread):
                             self.log.warning("Recorder already running")
                         continue
                     extra_metadata = kw.get("extra_metadata")
-                    self._start_worker(kw["fftshift"], kw["acclen"], extra_metadata)
+                    self._start_worker(kw["fftshift_p0"], kw["fftshift_p1"], kw["acclen"], extra_metadata)
                 elif cmd == "stop":
                     if self.recorder.is_recording:
                         self.recorder.stop_recording()
                 elif cmd == "start_point_recording":
                     source_idx = kw.get("source_idx")
+                    format_dict = kw.get("format_dict")
                     if source_idx is not None:
-                        self.recorder.start_point_recording(source_idx)
+                        self.recorder.start_point_recording(source_idx, format_dict)
                     else:
                         if not self._shutting_down:
                             self.log.warning("Missing parameters for start_point_recording command")
-                elif cmd == "set_params":
-                    self.recorder.set_fftshift(kw["fftshift"])
-                    self.recorder.set_acclen(kw["acclen"])
-                elif cmd == "log_point_completion":
-                    source_ra = kw.get("source_ra")
-                    source_dec = kw.get("source_dec")
+                elif cmd == "stop_point_recording":
                     source_idx = kw.get("source_idx")
-                    antenna = kw.get("antenna")
-                    if source_ra is not None and source_dec is not None and source_idx is not None:
-                        self.recorder.log_point_to_file(source_ra, source_dec, source_idx, antenna)
+                    if source_idx is not None:
+                        self.recorder.stop_point_recording(source_idx)
                     else:
                         if not self._shutting_down:
-                            self.log.warning("Missing parameters for log_point_completion command")
+                            self.log.warning("Missing parameters for stop_point_recording command")
+                elif cmd == "set_params":
+                    self.recorder.set_fftshift(kw["fftshift_p0"], kw["fftshift_p1"])
+                    self.recorder.set_acclen(kw["acclen"])
                 else:
                     if not self._shutting_down:
                         self.log.warning("Unknown recorder cmd %s", cmd)
@@ -359,20 +313,30 @@ class AntennaPositionThread(threading.Thread):
         self._current_el = None
         self._tar_az = None
         self._tar_el = None
+        self._broker_ip = None
+        self._broker_port = None
+        self._az_topic = None
+        self._el_topic = None
 
     def _setup_mqtt(self):
         try:
             import paho.mqtt.client as mqtt
             from tracking.utils.config import config
+            import uuid
             if self.ant == "N":
                 broker_ip = config.mqtt.north_broker_ip
             elif self.ant == "S":
                 broker_ip = config.mqtt.south_broker_ip
             else:
                 raise ValueError(f"Invalid antenna '{self.ant}'. Must be 'N' or 'S'.")
-            self.mqtt_client = mqtt.Client(client_id=f"pos_monitor_{self.ant}")
+            self._broker_ip = broker_ip
+            self._broker_port = config.mqtt.port
+            self._az_topic = config.mqtt.topic_az_status
+            self._el_topic = config.mqtt.topic_el_status
+            self.mqtt_client = mqtt.Client(client_id=f"pos_monitor_{self.ant}_{uuid.uuid4().hex[:8]}")
             self.mqtt_client.on_connect = self._on_connect
             self.mqtt_client.on_message = self._on_message
+            self.mqtt_client.on_disconnect = self._on_disconnect
             self.mqtt_client.connect(broker_ip, config.mqtt.port, config.mqtt.connection_timeout)
             self.mqtt_client.loop_start()
             timeout = config.mqtt.connection_wait_timeout
@@ -381,8 +345,8 @@ class AntennaPositionThread(threading.Thread):
                 time.sleep(config.mqtt.poll_sleep_interval)
             if not self.mqtt_connected:
                 raise ConnectionError(f"Failed to connect to MQTT broker {broker_ip}:{config.mqtt.port} within {timeout}s")
-            self.mqtt_client.subscribe(config.mqtt.topic_az_status)
-            self.mqtt_client.subscribe(config.mqtt.topic_el_status)
+            self.mqtt_client.subscribe(self._az_topic)
+            self.mqtt_client.subscribe(self._el_topic)
             if not self._shutting_down:
                 self.log.info(f"MQTT position monitoring started for antenna {self.ant}")
         except Exception as exc:
@@ -395,9 +359,19 @@ class AntennaPositionThread(threading.Thread):
             self.mqtt_connected = True
             if not self._shutting_down:
                 self.log.info(f"MQTT connected for antenna {self.ant}")
+            # Resubscribe to topics on reconnect
+            if self._az_topic:
+                client.subscribe(self._az_topic)
+            if self._el_topic:
+                client.subscribe(self._el_topic)
         else:
             if not self._shutting_down:
                 self.log.error(f"MQTT connection failed for antenna {self.ant}: {rc}")
+
+    def _on_disconnect(self, client, userdata, rc):
+        self.mqtt_connected = False
+        if not self._shutting_down:
+            self.log.warning(f"MQTT disconnected for antenna {self.ant} (rc={rc}). Will attempt to reconnect.")
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -407,14 +381,14 @@ class AntennaPositionThread(threading.Thread):
             if not data or 'v' not in data:
                 return
             v = data['v']
-            if msg.topic == config.mqtt.topic_az_status:
+            if msg.topic == self._az_topic:
                 if 'act_pos' in v:
                     self._current_az = float(v['act_pos'])
                 if 'target_pos' in v:
                     self._tar_az = float(v['target_pos'])
                 if 'set_pos' in v:
                     self._set_az = float(v['set_pos'])
-            elif msg.topic == config.mqtt.topic_el_status:
+            elif msg.topic == self._el_topic:
                 if 'act_pos' in v:
                     self._current_el = float(v['act_pos'])
                 if 'target_pos' in v:
@@ -442,8 +416,20 @@ class AntennaPositionThread(threading.Thread):
             except Exception as exc:
                 pass
 
+    def _ensure_mqtt_connected(self):
+        # Try to reconnect if not connected
+        if not self.mqtt_connected and self.mqtt_client is not None:
+            try:
+                self.log.info(f"Attempting MQTT reconnect for antenna {self.ant}")
+                self.mqtt_client.reconnect()
+            except Exception as exc:
+                self.log.error(f"MQTT reconnect failed for antenna {self.ant}: {exc}")
+
     def run(self):
         self._setup_mqtt()
         while self.running:
+            # Periodically check connection and try to reconnect if needed
+            if self.mqtt_client is not None and not self.mqtt_connected:
+                self._ensure_mqtt_connected()
             time.sleep(1.0)
         self.cleanup_mqtt() 

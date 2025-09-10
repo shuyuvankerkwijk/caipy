@@ -25,6 +25,7 @@ import pytz
 from pytz import timezone
 
 from tracking import Source
+from gui.widgets.queue_widget import QueueWidget
 
 # -----------------------------------------------------------------------------
 # ObservationPanel – unified observation control panel
@@ -68,7 +69,10 @@ class Observation:
                     entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;Az={params['az']:.2f}° El={params['el']:.2f}°"
             else:
                 entry_html += f"<b>{idx+1}. SCHEDULED:</b> {self.mode.upper()} {self.ant} @ {start_str}<br>"
-                entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;RA={params['ra']:.2f}h Dec={params['dec']:.2f}°"
+                if self.mode == "rtos":
+                    entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}°"
+                else:
+                    entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;RA={params['ra']:.2f}h Dec={params['dec']:.2f}°"
         else:
             if self.mode == "slew":
                 entry_html += f"<b>{idx+1}. QUEUED:</b> SLEW {self.ant}<br>"
@@ -78,12 +82,18 @@ class Observation:
                     entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;Az={params['az']:.2f}° El={params['el']:.2f}°"
             else:
                 entry_html += f"<b>{idx+1}. QUEUED:</b> {self.mode.upper()} {self.ant}<br>"
-                entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;RA={params['ra']:.2f}h Dec={params['dec']:.2f}°"
+                if self.mode == "rtos":
+                    entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}°"
+                else:
+                    entry_html += f"&nbsp;&nbsp;&nbsp;&nbsp;RA={params['ra']:.2f}h Dec={params['dec']:.2f}°"
         # Highlight based on state
+        # Highlight current running item in green, and (only when queue is stopped)
+        # the next item to run in red. Background highlights are intentional here
+        # to improve visibility specifically in the queue list.
         if running:
-            return f"<div style='background-color: #d4edda; padding: 2px; border-radius: 3px;'>{entry_html}</div><div style='height: 5px;'></div>"
+            return f"<div style='background-color: #d4edda; padding: 4px; border-radius: 4px;'>{entry_html}</div><div style='height: 5px;'></div>"
         elif next_to_run:
-            return f"<div style='background-color: #f8d7da; padding: 2px; border-radius: 3px;'>{entry_html}</div><div style='height: 5px;'></div>"
+            return f"<div style='background-color: #f8d7da; padding: 4px; border-radius: 4px;'>{entry_html}</div><div style='height: 5px;'></div>"
         else:
             return f"<div>{entry_html}</div><div style='height: 5px;'></div>"
 
@@ -92,6 +102,12 @@ class ObservationPanel(QWidget):
     observation_requested = pyqtSignal(object)  # Emits an Observation object
     command_requested = pyqtSignal(str, str) # Emits antenna and command (e.g., "park", "stop")
     log_message_requested = pyqtSignal(str) # Emits a string to be logged
+    
+    # FFT shift testing signals
+    fftshift_test_start_requested = pyqtSignal(list, dict)  # Emits fftshift_list, current_attenuations
+    fftshift_test_stop_requested = pyqtSignal()  # Emits stop command
+    fftshift_set_requested = pyqtSignal(int, int)  # Emits fftshift_p0, fftshift_p1
+    fftshift_recording_start_requested = pyqtSignal(str, dict)  # Emits observation_name, metadata
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -110,7 +126,7 @@ class ObservationPanel(QWidget):
         layout.setSpacing(10)
 
         title = QLabel("Observation Panel")
-        title.setStyleSheet("font-weight: bold; font-size: 16pt; color: #2c3e50;")
+        title.setStyleSheet("font-weight: bold; font-size: 16pt; color: #2C3E50;")
         layout.addWidget(title)
 
         # Antenna selection
@@ -137,16 +153,19 @@ class ObservationPanel(QWidget):
         self.rb_slew = QRadioButton("SLEW")
         self.rb_rasta = QRadioButton("RASTA")
         self.rb_point = QRadioButton("OFFSETS")
+        self.rb_rtos = QRadioButton("RTOS")
         self.rb_track.setChecked(True)
         self.mode_btn_group = QButtonGroup(self)
         self.mode_btn_group.addButton(self.rb_track)
         self.mode_btn_group.addButton(self.rb_slew)
         self.mode_btn_group.addButton(self.rb_rasta)
         self.mode_btn_group.addButton(self.rb_point)
+        self.mode_btn_group.addButton(self.rb_rtos)
         mode_layout.addWidget(self.rb_track)
         mode_layout.addWidget(self.rb_slew)
         mode_layout.addWidget(self.rb_rasta)
         mode_layout.addWidget(self.rb_point)
+        mode_layout.addWidget(self.rb_rtos)
         mode_layout.addStretch()
         layout.addWidget(mode_group)
 
@@ -297,18 +316,57 @@ class ObservationPanel(QWidget):
         
         point_layout.addStretch()
         
+        # RTOS parameters
+        self.page_rtos = QWidget()
+        rtos_layout = QVBoxLayout(self.page_rtos)
+        rtos_params_row1 = QHBoxLayout()
+        self.sp_rtos_ra1 = QDoubleSpinBox(); self.sp_rtos_ra1.setRange(0, 24); self.sp_rtos_ra1.setDecimals(4); self.sp_rtos_ra1.setValue(12.0)
+        self.sp_rtos_dec1 = QDoubleSpinBox(); self.sp_rtos_dec1.setRange(-90, 90); self.sp_rtos_dec1.setDecimals(4); self.sp_rtos_dec1.setValue(45.0)
+        rtos_params_row1.addWidget(QLabel("RA1 (h):")); rtos_params_row1.addWidget(self.sp_rtos_ra1)
+        rtos_params_row1.addWidget(QLabel("Dec1 (°):")); rtos_params_row1.addWidget(self.sp_rtos_dec1)
+        rtos_layout.addLayout(rtos_params_row1)
+
+        rtos_params_row2 = QHBoxLayout()
+        self.sp_rtos_ra2 = QDoubleSpinBox(); self.sp_rtos_ra2.setRange(0, 24); self.sp_rtos_ra2.setDecimals(4); self.sp_rtos_ra2.setValue(12.0)
+        self.sp_rtos_dec2 = QDoubleSpinBox(); self.sp_rtos_dec2.setRange(-90, 90); self.sp_rtos_dec2.setDecimals(4); self.sp_rtos_dec2.setValue(45.0)
+        rtos_params_row2.addWidget(QLabel("RA2 (h):")); rtos_params_row2.addWidget(self.sp_rtos_ra2)
+        rtos_params_row2.addWidget(QLabel("Dec2 (°):")); rtos_params_row2.addWidget(self.sp_rtos_dec2)
+        rtos_layout.addLayout(rtos_params_row2)
+
+        rtos_params_row3 = QHBoxLayout()
+        self.sp_rtos_len = QDoubleSpinBox(); self.sp_rtos_len.setRange(0.0, 24.0); self.sp_rtos_len.setDecimals(4); self.sp_rtos_len.setValue(1.0)
+        self.sp_rtos_npts = QSpinBox(); self.sp_rtos_npts.setRange(2, 1000); self.sp_rtos_npts.setValue(10)
+        rtos_params_row3.addWidget(QLabel("Len (h):")); rtos_params_row3.addWidget(self.sp_rtos_len)
+        rtos_params_row3.addWidget(QLabel("Total Points:")); rtos_params_row3.addWidget(self.sp_rtos_npts)
+        rtos_layout.addLayout(rtos_params_row3)
+
+        # RTOS options on new line
+        rtos_options = QHBoxLayout()
+        self.chk_rtos_no_slew = QCheckBox("No Slew")
+        self.chk_rtos_no_park = QCheckBox("No Park")
+        self.chk_rtos_record = QCheckBox("Record")
+        self.chk_rtos_record.setChecked(True)
+        rtos_options.addWidget(self.chk_rtos_no_slew)
+        rtos_options.addWidget(self.chk_rtos_no_park)
+        rtos_options.addWidget(self.chk_rtos_record)
+        rtos_options.addStretch()
+        rtos_layout.addLayout(rtos_options)
+
+        rtos_layout.addStretch()
+
         # Add to stacked
         self.stacked.addWidget(self.page_track)
         self.stacked.addWidget(self.page_slew)
         self.stacked.addWidget(self.page_rasta)
         self.stacked.addWidget(self.page_point)
+        self.stacked.addWidget(self.page_rtos)
         layout.addWidget(QLabel("Mode Parameters"))
         layout.addWidget(self.stacked)
 
         # Action buttons
         btn_row = QHBoxLayout()
         self.btn_run = QPushButton("\u25B6 RUN NOW")
-        self.btn_run.setStyleSheet("background-color: #28a745;")
+        self.btn_run.setStyleSheet("background-color: #4F8A69; border: 1px solid #3E6E54; color: #FFFFFF;")
         self.btn_queue = QPushButton("＋ QUEUE")
         self.btn_sched = QPushButton("＋ SCHEDULE")
         btn_row.addWidget(self.btn_run)
@@ -319,39 +377,81 @@ class ObservationPanel(QWidget):
         # Park/Stop buttons placed above the queue widget
         btn_row2 = QHBoxLayout()
         self.btn_park = QPushButton("PARK")
-        self.btn_park.setStyleSheet("background-color: #ffc107; color: #333;")
+        self.btn_park.setStyleSheet("background-color: #FFC857; color: #2C3E50; border: 1px solid #D9A63F;")
         self.btn_stop = QPushButton("STOP")
-        self.btn_stop.setStyleSheet("background-color: #dc3545;")
+        self.btn_stop.setStyleSheet("background-color: #9B2D14; border: 1px solid #7C230F; color: #FFFFFF;")
         btn_row2.addWidget(self.btn_park)
         btn_row2.addWidget(self.btn_stop)
         layout.addLayout(btn_row2)
         
-        # Queue and Schedule Display
-        queue_box = QGroupBox("Queue")
-        queue_layout = QVBoxLayout(queue_box)
-        
-        # Queue list
-        self.queue_list = QTextEdit()
-        self.queue_list.setReadOnly(True)
-        self.queue_list.setMaximumHeight(200)  # Increased height for better visibility
-        self.queue_list.setPlaceholderText("No queued or scheduled observations")
-        queue_layout.addWidget(self.queue_list)
+        # Queue and Schedule Display (modular widget)
+        self.queue_widget = QueueWidget()
+        self.queue_list = self.queue_widget.queue_list
+        self.btn_clear_queue = self.queue_widget.btn_clear_queue
+        self.btn_remove_last = self.queue_widget.btn_remove_last
+        self.btn_run_queue = self.queue_widget.btn_run_queue
+        self.btn_stop_queue = self.queue_widget.btn_stop_queue
+        layout.addWidget(self.queue_widget)
 
-        # Queue controls
-        queue_controls = QHBoxLayout()
-        self.btn_clear_queue = QPushButton("Clear Queue")
-        self.btn_run_next = QPushButton("Run Next")
-        # New buttons for automatic queue execution
-        self.btn_run_queue = QPushButton("Run Queue")
-        self.btn_stop_queue = QPushButton("Stop Queue")
-        queue_controls.addWidget(self.btn_clear_queue)
-        queue_controls.addWidget(self.btn_run_next)
-        queue_controls.addWidget(self.btn_run_queue)
-        queue_controls.addWidget(self.btn_stop_queue)
-        queue_controls.addStretch()
-        queue_layout.addLayout(queue_controls)
+        # FFT Shift Testing Panel
+        fftshift_box = QGroupBox("FFT Shift Testing")
+        fftshift_layout = QVBoxLayout(fftshift_box)
         
-        layout.addWidget(queue_box)
+        # FFT shift list input
+        fftshift_row = QHBoxLayout()
+        fftshift_row.addWidget(QLabel("FFT Shift Values:"))
+        self.fftshift_list_edit = QTextEdit()
+        self.fftshift_list_edit.setMaximumHeight(60)
+        self.fftshift_list_edit.setPlaceholderText("Enter FFT shift values (one per line)\nExample:\n1000\n1500\n2000")
+        fftshift_row.addWidget(self.fftshift_list_edit)
+        fftshift_layout.addLayout(fftshift_row)
+        
+        # Test parameters
+        params_row = QHBoxLayout()
+        
+        # Duration
+        self.fft_test_duration = QSpinBox()
+        self.fft_test_duration.setRange(5, 3600)
+        self.fft_test_duration.setValue(300)
+        self.fft_test_duration.setSuffix(" s")
+        
+        # Attenuation step
+        self.fft_atten_step = QDoubleSpinBox()
+        self.fft_atten_step.setRange(0.25, 5.0)
+        self.fft_atten_step.setValue(0.5)
+        self.fft_atten_step.setDecimals(2)
+        self.fft_atten_step.setSuffix(" dB")
+        
+        params_row.addWidget(QLabel("Duration:"))
+        params_row.addWidget(self.fft_test_duration)
+        params_row.addWidget(QLabel("Atten Step:"))
+        params_row.addWidget(self.fft_atten_step)
+        fftshift_layout.addLayout(params_row)
+        
+        # Status and progress
+        self.fft_test_status = QLabel("Ready")
+        self.fft_test_status.setStyleSheet("color: #4F8A69; font-weight: bold;")
+        self.fft_test_progress = QProgressBar()
+        self.fft_test_progress.setVisible(False)
+        
+        fftshift_layout.addWidget(self.fft_test_status)
+        fftshift_layout.addWidget(self.fft_test_progress)
+        
+        # Control buttons
+        btn_row = QHBoxLayout()
+        self.btn_start_fft_test = QPushButton("Start Test")
+        self.btn_start_fft_test.setStyleSheet("background-color: #FFC857; border: 1px solid #D9A63F; color: #2C3E50;")
+        self.btn_stop_fft_test = QPushButton("Stop Test")
+        self.btn_stop_fft_test.setStyleSheet("background-color: #9B2D14; border: 1px solid #7C230F; color: #FFFFFF;")
+        self.btn_stop_fft_test.setEnabled(False)
+        
+        btn_row.addWidget(self.btn_start_fft_test)
+        btn_row.addWidget(self.btn_stop_fft_test)
+        fftshift_layout.addLayout(btn_row)
+        
+        # Temporarily hide the FFT Shift Testing panel from the GUI
+        fftshift_box.setVisible(False)
+        layout.addWidget(fftshift_box)
 
         layout.addStretch()
 
@@ -360,6 +460,7 @@ class ObservationPanel(QWidget):
         self.rb_slew.toggled.connect(self._on_mode_changed)
         self.rb_rasta.toggled.connect(self._on_mode_changed)
         self.rb_point.toggled.connect(self._on_mode_changed)
+        self.rb_rtos.toggled.connect(self._on_mode_changed)
         # Connect antenna selection to mode changed for split checkbox visibility
         self.rb_north.toggled.connect(self._on_mode_changed)
         self.rb_south.toggled.connect(self._on_mode_changed)
@@ -378,9 +479,17 @@ class ObservationPanel(QWidget):
         self.btn_park.clicked.connect(self._do_park)
         self.btn_stop.clicked.connect(self._do_stop)
         self.btn_clear_queue.clicked.connect(self._clear_queue)
-        self.btn_run_next.clicked.connect(self._run_next)
+        self.btn_remove_last.clicked.connect(self._remove_most_recent)
         self.btn_run_queue.clicked.connect(self._run_queue)
         self.btn_stop_queue.clicked.connect(self._stop_queue)
+        
+        # Connect FFT shift test signals
+        self.btn_start_fft_test.clicked.connect(self._start_fftshift_test)
+        self.btn_stop_fft_test.clicked.connect(self._stop_fftshift_test)
+        
+        # Initialize FFT test state
+        self.fft_test_running = False
+        self.fft_test_thread = None
 
     def _on_mode_changed(self):
         if self.rb_track.isChecked():
@@ -391,6 +500,8 @@ class ObservationPanel(QWidget):
             self.stacked.setCurrentIndex(2)
         elif self.rb_point.isChecked():
             self.stacked.setCurrentIndex(3)
+        elif self.rb_rtos.isChecked():
+            self.stacked.setCurrentIndex(4)
             
         # --- Split checkbox visibility logic ---
         ant = self._get_selected_ant()
@@ -427,6 +538,8 @@ class ObservationPanel(QWidget):
             return "slew"
         elif self.rb_rasta.isChecked():
             return "rasta"
+        elif self.rb_rtos.isChecked():
+            return "rtos"
         else:
             return "pointing_scan"
 
@@ -469,6 +582,19 @@ class ObservationPanel(QWidget):
                 "record": self.chk_rasta_record.isChecked(),
                 "split_track": self.chk_rasta_split.isChecked(),
             }
+        elif mode == "rtos":
+            # Duplicate ra/dec as primary target for display/logging compatibility
+            params = {
+                "ra": self.sp_rtos_ra1.value(),
+                "dec": self.sp_rtos_dec1.value(),
+                "ra2": self.sp_rtos_ra2.value(),
+                "dec2": self.sp_rtos_dec2.value(),
+                "duration_hours": self.sp_rtos_len.value(),
+                "number_of_points": self.sp_rtos_npts.value(),
+                "slew": not self.chk_rtos_no_slew.isChecked(),
+                "park": not self.chk_rtos_no_park.isChecked(),
+                "record": self.chk_rtos_record.isChecked(),
+            }
         elif mode == "pointing_scan":
             params = {
                 "ra": self.sp_point_ra.value(),
@@ -488,6 +614,8 @@ class ObservationPanel(QWidget):
         mode = self._get_selected_mode()
         params = self._collect_params()
         obs = Observation(ant, mode, params)
+        # Track current observation so downstream logic (e.g., recording) has full context
+        self._current_obs = obs
         self.observation_requested.emit(obs)
         
         # Log the command once for both antennas
@@ -501,6 +629,8 @@ class ObservationPanel(QWidget):
                     self._log(f"RUN NOW: SLEW BOTH Az={params['az']:.2f}° El={params['el']:.2f}°")
             elif mode == "rasta":
                 self._log(f"RUN NOW: RASTA BOTH RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
+            elif mode == "rtos":
+                self._log(f"RUN NOW: RTOS BOTH RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}° RA2={params['ra2']:.2f}h Dec2={params['dec2']:.2f}°")
             elif mode == "pointing_scan":
                 self._log(f"RUN NOW: POINTING BOTH RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
         else:
@@ -513,6 +643,8 @@ class ObservationPanel(QWidget):
                     self._log(f"RUN NOW: SLEW {ant} Az={params['az']:.2f}° El={params['el']:.2f}°")
             elif mode == "rasta":
                 self._log(f"RUN NOW: RASTA {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
+            elif mode == "rtos":
+                self._log(f"RUN NOW: RTOS {ant} RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}° RA2={params['ra2']:.2f}h Dec2={params['dec2']:.2f}°")
             elif mode == "pointing_scan":
                 self._log(f"RUN NOW: POINTING {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
 
@@ -522,7 +654,6 @@ class ObservationPanel(QWidget):
         params = self._collect_params()
         entry = Observation(ant, mode, params)
         observation_queue.append(entry)
-        print(f"DEBUG: Added to queue, queue now: {observation_queue}")
         # Log correct parameters for each mode
         if mode == "slew":
             if 'ra' in params:
@@ -530,7 +661,10 @@ class ObservationPanel(QWidget):
             else:
                 self._log(f"Added to queue: SLEW {ant} Az={params['az']:.2f}° El={params['el']:.2f}°")
         else:
-            self._log(f"Added to queue: {mode.upper()} {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
+            if mode == "rtos":
+                self._log(f"Added to queue: RTOS {ant} RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}° RA2={params['ra2']:.2f}h Dec2={params['dec2']:.2f}°")
+            else:
+                self._log(f"Added to queue: {mode.upper()} {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
         self._update_queue_display()
 
     def _schedule_obs(self):
@@ -652,23 +786,31 @@ class ObservationPanel(QWidget):
         self.queue_list.setHtml(html_text)
     
     def _clear_queue(self):
-        """Clear all queued and scheduled observations."""
-        observation_queue.clear()
-        self._stop_queue() # Also stop processing
+        """Clear all queued and scheduled observations except the currently running one."""
+        current = self._current_obs
+        # Keep running observation if any, remove all others
+        if current is None:
+            observation_queue.clear()
+        else:
+            observation_queue[:] = [obs for obs in observation_queue if obs == current]
+        self._stop_queue()  # Also stop processing (will keep current running item if present)
         self._update_queue_display()
-        self._log("Queue cleared")
-    
-    def _run_next(self):
-        """Run the next observation from the queue (single step)."""
+        self._log("Queue cleared (kept current observation)" if current else "Queue cleared")
+
+    def _remove_most_recent(self):
+        """Remove the most recently added observation item (LIFO)."""
         if not observation_queue:
-            self._log("No observations in queue")
+            self._log("Queue is already empty")
             return
-        
-        # Use the same helper as automatic runner so logic stays identical
-        ran = self._start_next_in_queue(single_step=True)
-        if not ran:
-            self._log("No observation ready to run (may be waiting for scheduled time or conflict)")
+        # If current observation is at the end, skip it and remove the previous one
+        if self._current_obs and observation_queue[-1] == self._current_obs and len(observation_queue) > 1:
+            removed = observation_queue.pop(-2)
+        else:
+            removed = observation_queue.pop()
+        self._log(f"Removed: {removed.mode.upper()} {removed.ant}")
         self._update_queue_display()
+    
+    # _run_next removed along with the button per request
     
     def _can_run_queued_observation(self, obs: Observation):
         """Check if a queued observation can run without conflicting with scheduled observations."""
@@ -707,9 +849,15 @@ class ObservationPanel(QWidget):
                 self._log(f"RUNNING QUEUED: SLEW {ant} Az={params['az']:.2f}° El={params['el']:.2f}°")
         else:
             if obs.start:
-                self._log(f"RUNNING SCHEDULED: {mode.upper()} {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
+                if mode == "rtos":
+                    self._log(f"RUNNING SCHEDULED: RTOS {ant} RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}° RA2={params['ra2']:.2f}h Dec2={params['dec2']:.2f}°")
+                else:
+                    self._log(f"RUNNING SCHEDULED: {mode.upper()} {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
             else:
-                self._log(f"RUNNING QUEUED: {mode.upper()} {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
+                if mode == "rtos":
+                    self._log(f"RUNNING QUEUED: RTOS {ant} RA1={params['ra']:.2f}h Dec1={params['dec']:.2f}° RA2={params['ra2']:.2f}h Dec2={params['dec2']:.2f}°")
+                else:
+                    self._log(f"RUNNING QUEUED: {mode.upper()} {ant} RA={params['ra']:.2f}h Dec={params['dec']:.2f}°")
         
     # ------------------------------------------------------------------
     # Automatic queue runner helpers (inside ObservationPanel)
@@ -727,8 +875,6 @@ class ObservationPanel(QWidget):
 
     def _run_queue(self):
         """Begin running the entire queue sequentially."""
-        if self.queue_running:
-            return  # already running
         self.queue_running = True
         self.queue_check_timer.start(1000) # Check every second
         self._log("Queue processing started")
@@ -750,34 +896,25 @@ class ObservationPanel(QWidget):
         self._update_queue_display()
 
     def _start_next_in_queue(self, *, single_step: bool = False):
-        """Launch the next ready observation. If *single_step* is True, run only one.
-        When automatic mode is active this function calls itself again when the
-        running observation finishes."""
-
         # Check that both antennas are idle before starting next observation
         mainwin = self.window() if hasattr(self, 'window') else None
         if mainwin is not None:
             north_idle = "Idle" in mainwin.lbl_north_status.text()
             south_idle = "Idle" in mainwin.lbl_south_status.text()
             if not (north_idle and south_idle):
-                print("DEBUG: Not starting next queue item, antennas not idle.")
                 if self.queue_running and not self._current_obs:
                     self._log("Waiting for both antennas to be idle before starting next observation...")
                 return False
-
-        print(f"DEBUG: _start_next_in_queue called, queue: {observation_queue}")
         if not observation_queue:
             if self.queue_running:
                 self._log("Queue empty — nothing more to run")
                 self.queue_running = False
             return False
-
         # Sort: scheduled first by start time, then queued by added time
         sorted_queue = sorted(
             observation_queue,
             key=lambda x: (x.start is None, x.start or x.added_time)
         )
-
         tz_la = timezone('America/Los_Angeles')
         current_time = datetime.now(tz_la)
         for next_obs in sorted_queue:
@@ -787,14 +924,11 @@ class ObservationPanel(QWidget):
                     ready = False
             else:
                 ready = self._can_run_queued_observation(next_obs)
-            print(f"DEBUG: Considering obs: {next_obs}, ready={ready}")
             if ready:
                 # Set as current observation but DO NOT remove from queue yet
                 self._current_obs = next_obs
-                
                 # Update display to highlight the running task
                 self._update_queue_display()
-                
                 self._run_observation_from_queue(next_obs)
                 ants = ["N", "S"] if next_obs.ant == "both" else [next_obs.ant]
                 self._obs_remaining_ants = set(ants)
@@ -803,7 +937,6 @@ class ObservationPanel(QWidget):
                 if single_step:
                     return True
                 return True
-        print("DEBUG: No ready observation found in queue.")
         if self.queue_running:
             if not self._current_obs: # only show waiting if truly idle
                 self._log("No observation ready to run, waiting...")
@@ -812,14 +945,16 @@ class ObservationPanel(QWidget):
 
     def _on_tracker_completion(self, ant: str):
         """Called when an individual antenna signals completion."""
-        print(f"DEBUG: Tracker completion received for {ant}. Remaining: {getattr(self, '_obs_remaining_ants', None)}")
         if self._current_obs is None:
             return
         if hasattr(self, '_obs_remaining_ants'):
             self._obs_remaining_ants.discard(ant)
             if not self._obs_remaining_ants:
-                print("DEBUG: All antennas complete, starting next queue item if running.")
                 self._on_observation_finished()
+            else:
+                pass
+        else:
+            self._on_observation_finished()
 
     def _on_observation_finished(self):
         """Current multi-antenna observation finished."""
@@ -829,18 +964,102 @@ class ObservationPanel(QWidget):
             try:
                 observation_queue.remove(finished_obs)
             except ValueError:
-                # This can happen if queue was cleared manually
-                print(f"DEBUG: Could not find finished observation in queue to remove: {finished_obs}")
+                print(f"Could not find finished observation in queue to remove: {finished_obs}")
         
         self._current_obs = None
         
         # Update display now that task is removed
         self._update_queue_display()
         
-        if self.queue_running:
-            # Immediately check for the next item without waiting for the timer
+        if not observation_queue:
+            self.queue_running = False
+            self.queue_check_timer.stop()
+            self._log("Queue empty — nothing more to run")
+        elif self.queue_running:
             self._start_next_in_queue()
         else:
-            print("DEBUG: Queue stopped, not starting next observation.")
             self._log("Queue processing stopped.")
-            self._update_queue_display() 
+            self._update_queue_display()
+
+    def _start_fftshift_test(self):
+        """Start the FFT shift testing sequence."""
+        try:
+            # Parse FFT shift values
+            fftshift_text = self.fftshift_list_edit.toPlainText().strip()
+            if not fftshift_text:
+                self.log_message_requested.emit("Please enter FFT shift values")
+                return
+            
+            fftshift_list = []
+            for line in fftshift_text.split('\n'):
+                line = line.strip()
+                if line:
+                    try:
+                        value = int(line)
+                        if 0 <= value <= 4095:
+                            fftshift_list.append(value)
+                        else:
+                            self.log_message_requested.emit(f"FFT shift value {value} must be between 0 and 4095")
+                            return
+                    except ValueError:
+                        self.log_message_requested.emit(f"Invalid FFT shift value: {line}")
+                        return
+            
+            if not fftshift_list:
+                self.log_message_requested.emit("No valid FFT shift values entered")
+                return
+            
+            # Get current attenuations
+            from utils.ftx import FTXController, Antenna, Polarization
+            ftx_north = FTXController(Antenna.NORTH)
+            ftx_south = FTXController(Antenna.SOUTH)
+            
+            current_attenuations = {}
+            try:
+                for pol in [Polarization.POL0, Polarization.POL1]:
+                    data_n = ftx_north.get_monitor_data(pol)
+                    data_s = ftx_south.get_monitor_data(pol)
+                    if data_n:
+                        current_attenuations[f'north_pol{pol.value}'] = data_n.attenuation_db
+                    if data_s:
+                        current_attenuations[f'south_pol{pol.value}'] = data_s.attenuation_db
+            except Exception as e:
+                self.log_message_requested.emit(f"Could not get current attenuations: {e}")
+                # Use default values
+                current_attenuations = {
+                    'north_pol0': 0.0, 'north_pol1': 0.0,
+                    'south_pol0': 0.0, 'south_pol1': 0.0
+                }
+            
+            # Start test sequence
+            self.fft_test_running = True
+            self.btn_start_fft_test.setEnabled(False)
+            self.btn_stop_fft_test.setEnabled(True)
+            self.fft_test_progress.setVisible(True)
+            self.fft_test_progress.setValue(0)
+            self.fft_test_status.setText("Starting test...")
+            
+            # Emit signal to main window to start the test
+            self.fftshift_test_start_requested.emit(fftshift_list, current_attenuations)
+            
+        except Exception as e:
+            self.log_message_requested.emit(f"Error starting FFT shift test: {e}")
+            self._stop_fftshift_test()
+
+    def _stop_fftshift_test(self):
+        """Stop the FFT shift testing sequence."""
+        self.fft_test_running = False
+        self.btn_start_fft_test.setEnabled(True)
+        self.btn_stop_fft_test.setEnabled(False)
+        self.fft_test_progress.setVisible(False)
+        self.fft_test_status.setText("Test stopped")
+        self.log_message_requested.emit("FFT shift test stopped by user")
+        
+        # Emit signal to main window to stop the test
+        self.fftshift_test_stop_requested.emit()
+
+    def _run_fftshift_test_sequence(self, fftshift_list, current_attenuations):
+        """Run the FFT shift testing sequence in a separate thread."""
+        # This method is now handled by the main window
+        # The observation panel just emits signals to the main window
+        pass 

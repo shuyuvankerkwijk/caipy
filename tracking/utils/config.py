@@ -1,14 +1,13 @@
 """
-tracking/config.py - Configuration settings for the telescope tracking package
-
-This module provides standalone configuration for the tracking package,
-making it independent of the main application configuration.
+Configuration settings.
 """
+
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 import astropy.units as u
 from astropy.coordinates import EarthLocation
+import uuid
 
 @dataclass
 class TelescopeConfig:
@@ -71,13 +70,21 @@ class TelescopeConfig:
     relative_humidity: float = 20 # %
     
     # Pointing model
-    #                  flex sin, flex cos, az tilt ha, az tilt lat, el tilt, collim x, collim y, az zero, el zero, az sin, az cos
-    n_ppar = [0.047662, -0.019278, 0.420949, 0.216930, -0.023133, 0.000000, 0.000000, -0.031568, 0.000000, 0.011365, -0.008912]
-    s_ppar = [0.000000, -0.076122, 0.054547, -0.044196, 0.005655, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
+    #         flex sin, flex cos, az tilt ha, az tilt lat, el tilt, collim x, collim y, az zero, el zero, az sin, az cos
     #n_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
-    #s_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
+    #n_ppar = [0.047662, -0.019278, 0.420949, 0.216930, -0.023133, 0.000000, 0.000000, -0.031568, 0.000000, 0.011365, -0.008912] # first 
+    n_ppar = [0.074955, 0.016517, 0.418827, 0.211861, -0.027866, 0.000000, 0.000000, -0.021731, 0.000000, 0.010800, -0.003799] # second
+    # n_ppar = [-1.2121048, -1.37270249, 0.418827, 0.211861, -0.027866, 0.16761969, -1.04957482, -0.021731, 0., 0.0108, -0.003799] # aug 13
+    # n_ppar = [-0.74841337, -0.85653905, 0.418827, 0.211861, -0.027866, 0.20896854, -0.4550536, -0.021731, 0., 0.0108, -0.003799] # aug 14
+    # n_ppar = [0.26729702, 0.37275525, 0.418827, 0.211861, -0.027866, 0.02834344, 0.79645149, -0.021731, 0., 0.0108, -0.003799] # aug 15
 
-    sto: float = 1.173   # seconds
+    #s_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
+    s_ppar = [0.000000, -0.076122, 0.054547, -0.044196, 0.005655, 0.000000, 0.000000, 0.045432, 0.000000, 0.000000, 0.000000] # first
+    # s_ppar = [0.14523604, 0.26890383, 0.054547, -0.044196, 0.005655, 0.19844056, 0.9788166, 0.045432, 0., 0., 0.] # aug 14
+    # s_ppar = [0.90858391, 1.0035924, 0.054547, -0.044196, 0.005655, 0.18495915, 2.07956971, 0.045432, 0., 0., 0.] # aug 15
+
+    sto_N: float = -0.051 # seconds -77.566 (7pm 19th), 10pm 20th
+    sto_S: float = -91.304 # seconds -87.992 (7pm 19th), 10pm 20th
     delay: float = 3.0   # seconds
 
     def __post_init__(self):
@@ -100,7 +107,6 @@ class TelescopeConfig:
         if self.safe_elevation_candidates is None:
             self.safe_elevation_candidates = [15, 13, 20, 18, 25, 30, 35, 40, 45, 50]
 
-
 @dataclass
 class MQTTConfig:
     """MQTT configuration parameters."""
@@ -108,7 +114,7 @@ class MQTTConfig:
     north_broker_ip: str = "192.168.65.60" #"000.000.00.00"
     south_broker_ip: str = "192.168.65.50" #"000.000.00.01"
     port: int = 1883
-    client_id: str = "spmac"  # Base client ID - will be made unique at runtime
+    client_id: str = None # will be made unique at runtime
     connection_timeout: int = 60
     connection_wait_timeout: float = 10.0
     
@@ -138,6 +144,11 @@ class MQTTConfig:
     mode_mapping: dict = None
     
     def __post_init__(self):
+        if self.client_id is None:
+            self.client_id = f"caipy_{uuid.uuid4().hex[:8]}"
+            print(f"MQTT client ID: {self.client_id}")
+
+        # Initialize mode mapping if not provided
         if self.mode_mapping is None:
             self.mode_mapping = {
                 1: "off",
@@ -159,7 +170,6 @@ class TrackingConfig:
     
     # Package settings
     version: str = "1.0.0"
-
 
 # Global configuration instance
 config = TrackingConfig()
