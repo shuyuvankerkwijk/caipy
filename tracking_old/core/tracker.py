@@ -346,7 +346,7 @@ class Tracker:
     # SPECIALTY METHODS
     # ============================================================================
 
-    def run_rasta_scan(self, ant: Antenna, source: Source, max_distance_deg: float, steps_deg: float, position_angle_deg: float, duration_hours: float, 
+    def run_rasta_scan(self, ant: str, source: Source, max_distance_deg: float, steps_deg: float, position_angle_deg: float, duration_hours: float, 
                        slew: bool = True, park: bool = True,
                        progress_callback: Optional[ProgressCallback] = None,
                        auto_cleanup: bool = True,
@@ -356,7 +356,7 @@ class Tracker:
         Run a Rasta scan. Returns True if successful, False otherwise.
         
         Args:
-            ant: Antenna enum (Antenna.NORTH or Antenna.SOUTH)
+            ant: Antenna identifier ("N" or "S")
             source: Source object with coordinates
             max_distance_deg: Maximum distance from center in degrees
             steps_deg: Step size in degrees
@@ -378,7 +378,7 @@ class Tracker:
             MQTTError: If MQTT communication fails
             OperationError: If tracking operation fails
         """
-        logger.info(f"[{antenna_letter(ant)}] Starting Rasta scan")
+        logger.info(f"[{ant}] Starting Rasta scan")
         logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
         logger.info(f"Max distance: {max_distance_deg:.2f}°, Steps: {steps_deg:.2f}°")
         logger.info(f"Duration: {duration_hours:.2f} hours at each step")
@@ -410,7 +410,7 @@ class Tracker:
 
         return self.run_track_multiple(ant, sources, duration_hours, slew, park, OperationType.RASTA_SCAN, progress_callback, auto_cleanup, on_run_signal, on_point_signal)
 
-    def run_pointing_offsets(self, ant: Antenna, source: Source, closest_distance_deg: float, number_of_points: int,
+    def run_pointing_offsets(self, ant: str, source: Source, closest_distance_deg: float, number_of_points: int,
                              duration_hours: float, slew: bool = True, park: bool = True,
                              progress_callback: Optional[ProgressCallback] = None,
                              auto_cleanup: bool = True,
@@ -433,7 +433,7 @@ class Tracker:
         if duration_hours <= 0:
             raise ValidationError(f"duration_hours must be positive, got {duration_hours}")
         
-        logger.info(f"[{antenna_letter(ant)}] Starting pointing-offset scan")
+        logger.info(f"[{ant}] Starting pointing-offset scan")
         logger.info(f"Target: RA={source.ra_hrs:.6f}h, Dec={source.dec_deg:.6f}°")
         logger.info(f"Closest distance: {closest_distance_deg:.2f}°, Points: {number_of_points}")
         logger.info(f"Duration: {duration_hours:.2f} hours at each point")
@@ -449,7 +449,7 @@ class Tracker:
 
         return self.run_track_multiple(ant, sources, duration_hours, slew, park, OperationType.POINTING_OFFSETS, progress_callback, auto_cleanup, on_run_signal, on_point_signal)
 
-    def run_rtos(self, ant: Antenna, source1: Source, source2: Source, number_of_points: int,
+    def run_rtos(self, ant: str, source1: Source, source2: Source, number_of_points: int,
                              duration_hours: float, slew: bool = True, park: bool = True,
                              progress_callback: Optional[ProgressCallback] = None,
                              auto_cleanup: bool = True,
@@ -463,7 +463,7 @@ class Tracker:
         if duration_hours <= 0:
             raise ValidationError(f"duration_hours must be positive, got {duration_hours}")
         
-        logger.info(f"[{antenna_letter(ant)}] Starting RTOS scan")
+        logger.info(f"[{ant}] Starting pointing-offset scan")
         logger.info(f"Target 1: RA={source1.ra_hrs:.6f}h, Dec={source1.dec_deg:.6f}°")
         logger.info(f"Target 2: RA={source2.ra_hrs:.6f}h, Dec={source2.dec_deg:.6f}°")
         logger.info(f"Duration: {duration_hours:.2f} hours at each point")
@@ -539,10 +539,8 @@ class Tracker:
                 raise
             raise MQTTError(f"Setup failed: {e}")
 
-    def _validate_target(self, source: Source, ant: Antenna, duration_hours: Optional[float] = None, start_time: Optional[datetime] = None) -> None:
-        """
-        Validate target coordinates and safety.
-        """
+    def _validate_target(self, source: Source, ant: str, duration_hours: Optional[float] = None, start_time: Optional[datetime] = None) -> None:
+        """Validate target coordinates and safety."""
         logger.info(f"Performing target validation...")
         validation_result = self.safety_checker.validate_target(pointing=self.pointing, source=source, ant=ant, check_time=start_time)
         validation_result.log_result(logger, "Target validation")

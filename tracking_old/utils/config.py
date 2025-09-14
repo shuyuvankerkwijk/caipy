@@ -13,9 +13,9 @@ import uuid
 class TelescopeConfig:
     """Telescope configuration parameters."""
     # Legacy single-location (midpoint)
-    lat_m: float = 37.23335 # degrees
-    lon_m: float = -118.28065 # degrees
-    height_m: float = 0 # Steve used a value of 1222.0m... he wasn't using Astropy though so that's probably why
+    lat_m: float = 37.23335
+    lon_m: float = -118.28065
+    height_m: float = 1222.0
     location_m: EarthLocation = None
 
     # Per-antenna geodetic coordinates (updated values)
@@ -36,8 +36,19 @@ class TelescopeConfig:
     sky_el: float = 0.0 # degrees
     sky_xel: float = 0.0 # degrees
     
+    # Safety
+    sun_safety_radius: float = 20.0 # degrees
+    sun_future_check_interval: float = 0.1  # hours between future checks
+    
+    # Path finding
+    detour_base_padding: float = 30.0 # degrees beyond safety radius for detour paths
+    detour_padding_step: float = 10.0 # degrees to increase padding by each iteration
+    detour_max_padding: float = 180.0 # maximum padding to try before giving up
+    safe_elevation_candidates: list = None # list of elevations to try for detour paths
+    
     # Movement
     start_tracking_tolerance: float = 10.0 # degrees
+    slew_simulation_steps: int = 50 # number of steps in the slew simulation
     
     # Axis mode settle/poll
     axis_mode_settle_timeout: float = 4.0 # seconds to wait for mode change
@@ -57,19 +68,24 @@ class TelescopeConfig:
     pressure_mb: float = 101.0 # mb
     temperature_C: float = 24.0 # C
     relative_humidity: float = 20 # %
-
-    # Tracking timing
-    sto_N: float = -0.048 # difference between mtex clocks and UTC
-    sto_S: float = -0.039 # difference between mtex clocks and UTC
-    delay: float = 3.0   # seconds
-
+    
     # Pointing model
     #         flex sin, flex cos, az tilt ha, az tilt lat, el tilt, collim x, collim y, az zero, el zero, az sin, az cos
     #n_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
-    n_ppar = [0.074955, 0.016517, 0.418827, 0.211861, -0.027866, 0.000000, 0.000000, -0.021731, 0.000000, 0.010800, -0.003799] # Steve's optical pointing model
+    #n_ppar = [0.047662, -0.019278, 0.420949, 0.216930, -0.023133, 0.000000, 0.000000, -0.031568, 0.000000, 0.011365, -0.008912] # first 
+    n_ppar = [0.074955, 0.016517, 0.418827, 0.211861, -0.027866, 0.000000, 0.000000, -0.021731, 0.000000, 0.010800, -0.003799] # second
+    # n_ppar = [-1.2121048, -1.37270249, 0.418827, 0.211861, -0.027866, 0.16761969, -1.04957482, -0.021731, 0., 0.0108, -0.003799] # aug 13
+    # n_ppar = [-0.74841337, -0.85653905, 0.418827, 0.211861, -0.027866, 0.20896854, -0.4550536, -0.021731, 0., 0.0108, -0.003799] # aug 14
+    # n_ppar = [0.26729702, 0.37275525, 0.418827, 0.211861, -0.027866, 0.02834344, 0.79645149, -0.021731, 0., 0.0108, -0.003799] # aug 15
 
     #s_ppar = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
-    s_ppar = [0.000000, -0.076122, 0.054547, -0.044196, 0.005655, 0.000000, 0.000000, 0.045432, 0.000000, 0.000000, 0.000000] # Steve's optical pointing model
+    s_ppar = [0.000000, -0.076122, 0.054547, -0.044196, 0.005655, 0.000000, 0.000000, 0.045432, 0.000000, 0.000000, 0.000000] # first
+    # s_ppar = [0.14523604, 0.26890383, 0.054547, -0.044196, 0.005655, 0.19844056, 0.9788166, 0.045432, 0., 0., 0.] # aug 14
+    # s_ppar = [0.90858391, 1.0035924, 0.054547, -0.044196, 0.005655, 0.18495915, 2.07956971, 0.045432, 0., 0., 0.] # aug 15
+
+    sto_N: float = -0.051 # seconds -77.566 (7pm 19th), 10pm 20th
+    sto_S: float = -91.304 # seconds -87.992 (7pm 19th), 10pm 20th
+    delay: float = 3.0   # seconds
 
     def __post_init__(self):
         # Per-antenna locations
@@ -87,34 +103,16 @@ class TelescopeConfig:
             self.location_s = EarthLocation(lat=self.lat_s * u.deg,
                                             lon=self.lon_s * u.deg,
                                             height=self.height_s * u.m)
-
-@dataclass
-class SunSafetyConfig:
-    """Sun Safety configuration parameters."""
-    # Safety
-    sun_safety_radius: float = 20.0 # degrees
-    sun_future_check_interval: float = 0.1  # hours between future checks
-    
-    # Path finding
-    detour_base_padding: float = 20.0 # degrees beyond safety radius for detour paths
-    detour_padding_step: float = 10.0 # degrees to increase padding by each iteration
-    detour_max_padding: float = 180.0 # maximum padding to try before giving up
-    safe_elevation_candidates: list = field(default_factory=lambda: [15, 13, 20, 18, 25, 30, 35, 40, 45, 50]) # list of elevations to try for detour paths
-
-    # Path generation
-    slew_simulation_steps: int = 50 # number of steps in the slew simulation
-    az_vel_max: int = 3.75 # deg / s
-    el_vel_max: int = 1.00 # deg / s
-    az_acc_max: int = 2.00 # deg / s^2
-    el_acc_max: int = 1.00 # deg / s^2
-
+        
+        if self.safe_elevation_candidates is None:
+            self.safe_elevation_candidates = [15, 13, 20, 18, 25, 30, 35, 40, 45, 50]
 
 @dataclass
 class MQTTConfig:
     """MQTT configuration parameters."""
     # Broker settings
-    north_broker_ip: str = "192.168.65.60" 
-    south_broker_ip: str = "192.168.65.50"
+    north_broker_ip: str = "192.168.65.60" #"000.000.00.00"
+    south_broker_ip: str = "192.168.65.50" #"000.000.00.01"
     port: int = 1883
     client_id: str = None # will be made unique at runtime
     connection_timeout: int = 60
@@ -143,29 +141,35 @@ class MQTTConfig:
     track_sleep_interval: float = 0.0001
     
     # Mode mapping from integer to string
-    mode_mapping: dict = field(default_factory=lambda: { 
-        1: "off",
-        6: "track",
-        3: "stop", 
-        5: "position"
-    })
+    mode_mapping: dict = None
     
     def __post_init__(self):
         if self.client_id is None:
             self.client_id = f"caipy_{uuid.uuid4().hex[:8]}"
             print(f"MQTT client ID: {self.client_id}")
 
+        # Initialize mode mapping if not provided
+        if self.mode_mapping is None:
+            self.mode_mapping = {
+                1: "off",
+                6: "track",
+                3: "stop", 
+                5: "position"
+            }
+
 @dataclass
 class TrackingConfig:
     """Main tracking package configuration."""
     # Component configs
     telescope: TelescopeConfig = field(default_factory=TelescopeConfig)
-    sun: SunSafetyConfig = field(default_factory=SunSafetyConfig)
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     
     # Logging
     log_level: str = "INFO"
     log_file: Optional[str] = None
+    
+    # Package settings
+    version: str = "1.0.0"
 
 # Global configuration instance
 config = TrackingConfig()

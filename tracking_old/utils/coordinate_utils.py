@@ -105,4 +105,4 @@ def get_targets_offsets(amp_offsets_deg: float, num_offsets: int, ra_hrs: float,
         return ra_hrs_list, dec_deg_list
 
     else:
-        raise NotImplementedError(f"Pattern with {num_offsets} offsets not implemented. Available: 5, 7, 9, 13.")
+        raise NotImplementedError("Pattern with {num_offsets} offsets not implemented. Available: 5, 7, 9, 13.")

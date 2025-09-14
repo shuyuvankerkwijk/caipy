@@ -154,9 +154,9 @@ class AstroPointing:
             raise ValueError(f"Invalid antenna: {ant}")
 
         # Convert parameters and az/el to radians
-        par = np.deg2rad(np.array(ppar, dtype=np.float64))
-        az = np.deg2rad(ide_az)
-        el = np.deg2rad(ide_el)
+        par = np.array(ppar, dtype=np.float64) * np.pi / 180
+        az = ide_az * np.pi / 180
+        el = ide_el * np.pi / 180
         
         # 1. Flexure
         el = el - par[0] * np.sin(el) - par[1] * np.cos(el)
@@ -249,4 +249,4 @@ class AstroPointing:
             az -= 2 * np.pi
         
         # Convert back to degrees
-        return np.rad2deg(az), np.rad2deg(el)
+        return az * 180 / np.pi, el * 180 / np.pi

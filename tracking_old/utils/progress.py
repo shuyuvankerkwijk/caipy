@@ -1,7 +1,7 @@
 """
 Progress callback interfaces for tracking operations
 """
-import logging
+
 from typing import Optional, Callable, Union
 from dataclasses import dataclass
 from enum import Enum
@@ -14,7 +14,6 @@ class OperationType(Enum):
     PARK = "park"
     RASTA_SCAN = "rasta_scan"
     POINTING_OFFSETS = "pointing_offsets"
-    RTOS = "rtos"
 
 @dataclass
 class ProgressInfo:
@@ -89,6 +88,7 @@ def create_progress_callback(callback_type: str = "logging", **kwargs) -> Option
         ProgressCallback instance or None
     """
     if callback_type == "logging":
+        import logging
         logger = logging.getLogger(__name__)
         return LoggingProgressCallback(logger)
     elif callback_type == "simple" and "callback_func" in kwargs:

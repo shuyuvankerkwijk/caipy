@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Command-line interface for the telescope tracking system.
-Provides CLI tools for tracking, slewing, and parking operations.
+
+This module provides CLI tools for tracking, slewing, and parking operations.
 """
 
 import argparse
 import sys
 import logging
-import traceback
 from tracking.core.tracker import Tracker
 from tracking.utils.source import Source
 from tracking.utils.progress import ProgressCallback, ProgressInfo, OperationType
@@ -16,6 +16,7 @@ from tracking.utils.antenna import Antenna, parse_antenna, antenna_letter
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
+
 
 class CLIProgressCallback(ProgressCallback):
     """Progress callback for CLI output."""
@@ -39,7 +40,7 @@ class CLIProgressCallback(ProgressCallback):
                     self.last_percent = progress_info.percent_complete
 
 def track_and_park(ant: str, ra_hrs: float = None, dec_deg: float = None, pm_ra: float = 0, pm_dec: float = 0, 
-                  plx: float = 0.0001, radvel: float = 0, duration_hours: int = 0.5, slew: bool = True, park: bool = True,
+                  plx: float = 0.0001, radvel: float = 0, duration_points: int = 3000, slew: bool = True, park: bool = True,
                   source: Source = None, progress_callback: ProgressCallback = None):
     """
     Track a source at the given RA/Dec coordinates and optionally park the telescope.
@@ -52,7 +53,7 @@ def track_and_park(ant: str, ra_hrs: float = None, dec_deg: float = None, pm_ra:
         pm_dec: Proper motion in Dec (mas/yr)
         plx: Parallax (mas)
         radvel: Radial velocity (km/s)
-        duration_hours: Number of hours to track (default 0.5)
+        duration_points: Number of 0.5s updates to queue (default 3000)
         slew: Whether to slew to source before tracking (default True)
         park: Whether to park the telescope after tracking (default True)
         source: Source object (alternative to providing ra_hrs/dec_deg)
@@ -75,7 +76,10 @@ def track_and_park(ant: str, ra_hrs: float = None, dec_deg: float = None, pm_ra:
                 logger.error("Error: Either source object or both ra_hrs and dec_deg must be provided")
                 return False
             source = Source(ra_hrs=ra_hrs, dec_deg=dec_deg, pm_ra=pm_ra, pm_dec=pm_dec, plx=plx, radvel=radvel)
-                
+        
+        # Calculate duration in hours
+        duration_hours = float(duration_points) * 0.5 / 3600
+        
         # Create CLI progress callback if none provided
         if progress_callback is None:
             progress_callback = CLIProgressCallback(ant_enum)
@@ -101,6 +105,7 @@ def track_and_park(ant: str, ra_hrs: float = None, dec_deg: float = None, pm_ra:
     except Exception as exc:
         logger.error(f"Unexpected error during tracking: {exc}")
         if __debug__:
+            import traceback
             traceback.print_exc()
         return False
 
@@ -172,6 +177,7 @@ def slew_to_position(ant: str, ra_hrs: float = None, dec_deg: float = None, pm_r
     except Exception as exc:
         logger.error(f"Unexpected error during slewing: {exc}")
         if __debug__:
+            import traceback
             traceback.print_exc()
         return False
 
@@ -217,10 +223,23 @@ def park_telescope(ant: str, progress_callback: ProgressCallback = None):
     except Exception as exc:
         logger.error(f"Unexpected error during parking: {exc}")
         if __debug__:
+            import traceback
             traceback.print_exc()
         return False
 
-def track_multiple_positions(ant: str, positions: list, pm_ra: float = 0, pm_dec: float = 0, plx: float = 0.0001, radvel: float = 0, duration_hours: int = 0.01, slew: bool = True, park: bool = True, progress_callback: ProgressCallback = None):
+
+def track_multiple_positions(
+    ant: str,
+    positions: list,
+    pm_ra: float = 0,
+    pm_dec: float = 0,
+    plx: float = 0.0001,
+    radvel: float = 0,
+    duration_points: int = 3000,
+    slew: bool = True,
+    park: bool = True,
+    progress_callback: ProgressCallback = None,
+):
     """
     Track multiple sources sequentially for a fixed duration each.
 
@@ -231,7 +250,7 @@ def track_multiple_positions(ant: str, positions: list, pm_ra: float = 0, pm_dec
         pm_dec: Proper motion in Dec (mas/yr) applied to all sources
         plx: Parallax (mas) applied to all sources
         radvel: Radial velocity (km/s) applied to all sources
-        duration_hours: Number of hours to track per source
+        duration_points: Number of 0.5s updates to queue per source
         slew: Whether to slew to first source before tracking
         park: Whether to park telescope after tracking
         progress_callback: Optional progress callback
@@ -256,6 +275,8 @@ def track_multiple_positions(ant: str, positions: list, pm_ra: float = 0, pm_dec
             Source(ra_hrs=float(ra), dec_deg=float(dec), pm_ra=pm_ra, pm_dec=pm_dec, plx=plx, radvel=radvel)
             for (ra, dec) in positions
         ]
+
+        duration_hours = float(duration_points) * 0.5 / 3600
 
         if progress_callback is None:
             progress_callback = CLIProgressCallback(ant_enum)
@@ -290,6 +311,7 @@ def track_multiple_positions(ant: str, positions: list, pm_ra: float = 0, pm_dec
     except Exception as exc:
         logger.error(f"Unexpected error during multiple tracking: {exc}")
         if __debug__:
+            import traceback
             traceback.print_exc()
         return False
 
@@ -314,7 +336,7 @@ def main():
     track_parser.add_argument("-pm_dec", type=float, default=0, help="Proper motion in Dec (mas/yr)")
     track_parser.add_argument("-plx", type=float, default=0.0001, help="Parallax (mas)")
     track_parser.add_argument("-radvel", type=float, default=0, help="Radial velocity (km/s)")
-    track_parser.add_argument("-n", "--duration_hours", type=int, default=0.5, help="Number of hours to track (default 0.5)")
+    track_parser.add_argument("-n", "--duration_points", type=int, default=3000, help="Number of 0.5s updates to queue (default 3000)")
     track_parser.add_argument("--no-slew", action="store_true", help="Don't slew to source")
     track_parser.add_argument("--no-park", action="store_true", help="Don't park the telescope after tracking")
     
@@ -351,7 +373,7 @@ def main():
     tm_parser.add_argument("-pm_dec", type=float, default=0, help="Proper motion in Dec (mas/yr)")
     tm_parser.add_argument("-plx", type=float, default=0.0001, help="Parallax (mas)")
     tm_parser.add_argument("-radvel", type=float, default=0, help="Radial velocity (km/s)")
-    tm_parser.add_argument("-n", "--duration_hours", type=int, default=0.01, help="Number of hours to track per source (default 0.01)")
+    tm_parser.add_argument("-n", "--duration_points", type=int, default=3000, help="Number of 0.5s updates to queue per source (default 3000)")
     tm_parser.add_argument("--no-slew", action="store_true", help="Don't slew to the first source")
     tm_parser.add_argument("--no-park", action="store_true", help="Don't park the telescope after tracking")
 
@@ -384,7 +406,7 @@ def main():
                 pm_dec=args.pm_dec,
                 plx=args.plx,
                 radvel=args.radvel,
-                duration_hours=args.duration_hours,
+                duration_points=args.duration_points,
                 slew=not args.no_slew,
                 park=not args.no_park
             )
@@ -434,7 +456,7 @@ def main():
                 pm_dec=args.pm_dec,
                 plx=args.plx,
                 radvel=args.radvel,
-                duration_hours=args.duration_hours,
+                duration_points=args.duration_points,
                 slew=not args.no_slew,
                 park=not args.no_park,
             )
@@ -450,6 +472,7 @@ def main():
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         if __debug__:
+            import traceback
             traceback.print_exc()
         sys.exit(1)
 

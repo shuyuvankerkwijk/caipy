@@ -15,7 +15,7 @@ from tracking.utils.antenna import Antenna, parse_antenna
 from tracking.utils.colors import Colors
 from tracking.utils.config import config
 from tracking.utils.source import Source
-from tracking.utils.helpers import angular_separation, generate_telescope_path
+from tracking.utils.helpers import angular_separation, shortest_azimuth_distance, generate_telescope_path
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SafetyResult:
     """Result of a safety check."""
+
     is_safe: bool
     message: str
     separation_deg: Optional[float] = None
@@ -68,10 +69,15 @@ class SafetyResult:
                     f"  {Colors.RED}Unsafe at path progress: {self.details['path_progress_percent']:.1f}%{Colors.RESET}"
                 )
 
+
 class SafetyChecker:
     """Checks telescope movements for sun safety."""
 
-    def __init__(self, location: Optional[EarthLocation] = None, safety_radius_deg: Optional[float] = None):
+    def __init__(
+        self,
+        location: Optional[EarthLocation] = None,
+        safety_radius_deg: Optional[float] = None,
+    ):
         """
         Initialize safety checker.
 
@@ -80,9 +86,16 @@ class SafetyChecker:
             safety_radius_deg: Minimum safe angular distance from sun (uses config if None)
         """
         self.location = location or config.telescope.location_m
-        self.safety_radius_deg = safety_radius_deg or config.sun.sun_safety_radius
+        self.safety_radius_deg = safety_radius_deg or config.telescope.sun_safety_radius
 
-    def check_position_safety(self, ra_hrs: Optional[float] = None, dec_deg: Optional[float] = None, az: Optional[float] = None, el: Optional[float] = None, check_time: Optional[datetime] = None) -> SafetyResult:
+    def check_position_safety(
+        self,
+        ra_hrs: Optional[float] = None,
+        dec_deg: Optional[float] = None,
+        az: Optional[float] = None,
+        el: Optional[float] = None,
+        check_time: Optional[datetime] = None,
+    ) -> SafetyResult:
         """
         Check if a target position is safe with respect to the sun.
         Args:
@@ -99,12 +112,15 @@ class SafetyChecker:
             check_time = datetime.now(timezone.utc)
 
         if az is not None and el is not None:
-            # Compute separation in horizontal frame (Alt/Az)
+            # Alt/Az mode – compute separation in horizontal frame
             target_az, target_el = az, el
             obs_time = Time(check_time)
-            sun_altaz = get_sun(obs_time).transform_to(AltAz(location=self.location, obstime=obs_time))
+            sun_altaz = get_sun(obs_time).transform_to(
+                AltAz(location=self.location, obstime=obs_time)
+            )
             sun_az = sun_altaz.az.deg
             sun_el = sun_altaz.alt.deg
+
             separation_deg = angular_separation(target_az, target_el, sun_az, sun_el)
             is_safe = separation_deg >= self.safety_radius_deg
 
@@ -125,7 +141,10 @@ class SafetyChecker:
             obs_time = Time(check_time)
             sun = get_sun(obs_time)
             sun_icrs = sun.transform_to("icrs")
-            target = SkyCoord(ra=ra_hrs * u.hourangle, dec=dec_deg * u.deg, frame="icrs")
+
+            target = SkyCoord(
+                ra=ra_hrs * u.hourangle, dec=dec_deg * u.deg, frame="icrs"
+            )
             separation_deg = target.separation(sun_icrs).deg
             is_safe = separation_deg >= self.safety_radius_deg
 
@@ -141,9 +160,15 @@ class SafetyChecker:
             )
 
         else:
-            raise ValueError("Must provide either Ra/Dec or Az/El coordinates")
+            raise ValueError("Must provide either ra/dec or az/el coordinates")
 
-    def check_run_safety(self, ra_hrs: float, dec_deg: float, duration_hours: float, start_time: Optional[datetime] = None) -> SafetyResult:
+    def check_run_safety(
+        self,
+        ra_hrs: float,
+        dec_deg: float,
+        duration_hours: float,
+        start_time: Optional[datetime] = None,
+    ) -> SafetyResult:
         """
         Check if a target position will remain safe from the sun for the duration of observation.
         Args:
@@ -157,12 +182,16 @@ class SafetyChecker:
         if start_time is None:
             start_time = datetime.now(timezone.utc)
 
-        check_times = np.arange(0, duration_hours, config.sun.sun_future_check_interval)
+        check_times = np.arange(
+            0, duration_hours, config.telescope.sun_future_check_interval
+        )
         check_times = [start_time + timedelta(hours=t) for t in check_times]
 
         separation_degs = []
         for check_time in check_times:
-            result = self.check_position_safety(ra_hrs=ra_hrs, dec_deg=dec_deg, check_time=check_time)
+            result = self.check_position_safety(
+                ra_hrs=ra_hrs, dec_deg=dec_deg, check_time=check_time
+            )
             separation_degs.append(result.separation_deg)
             if not result.is_safe:
                 return SafetyResult(
@@ -190,7 +219,14 @@ class SafetyChecker:
             },
         )
 
-    def check_path_safety(self, current_az: float, current_el: float, target_az: float, target_el: float, num_steps: Optional[int] = None) -> SafetyResult:
+    def check_path_safety(
+        self,
+        current_az: float,
+        current_el: float,
+        target_az: float,
+        target_el: float,
+        num_steps: Optional[int] = None,
+    ) -> SafetyResult:
         """
         Check if the path between two positions crosses too close to the sun.
         Args:
@@ -203,7 +239,7 @@ class SafetyChecker:
             SafetyResult: is_safe, message, separation_deg, details
         """
         if num_steps is None:
-            num_steps = config.sun.slew_simulation_steps
+            num_steps = config.telescope.slew_simulation_steps
 
         # Get current sun position in alt/az
         obs_time = Time(datetime.now(timezone.utc))
@@ -219,10 +255,10 @@ class SafetyChecker:
             target_az,
             target_el,
             num_steps,
-            az_vel_max=config.sun.az_vel_max,
-            el_vel_max=config.sun.el_vel_max,
-            az_acc_max=config.sun.az_acc_max,
-            el_acc_max=config.sun.el_acc_max,
+            az_vel_max=3.75,
+            el_vel_max=1.00,
+            az_acc_max=2.00,
+            el_acc_max=1.00,
         )
 
         # Check separation at each point
@@ -247,14 +283,24 @@ class SafetyChecker:
             },
         )
 
-    def validate_target(self, pointing: AstroPointing = None, source: Source = None, ant = None, az: float = None, el: float = None, ra_hrs: float = None, dec_deg: float = None, check_time: Optional[datetime] = None) -> SafetyResult:
+    def validate_target(
+        self,
+        pointing: AstroPointing = None,
+        source: Source = None,
+        ant = None,
+        az: float = None,
+        el: float = None,
+        ra_hrs: float = None,
+        dec_deg: float = None,
+        check_time: Optional[datetime] = None,
+    ) -> SafetyResult:
         """
         Validate that a target is above the horizon, within safe limits, and safe from the sun.
 
         Args:
             pointing: AstroPointing instance (required for source and ra/dec modes)
             source: Optional Source object to validate
-            ant: Antenna enum (Antenna.NORTH or Antenna.SOUTH) - required if using source or ra/dec
+            ant: Antenna identifier ("N" or "S") - required if using source or ra/dec
             az: Optional azimuth in degrees (use with el)
             el: Optional elevation in degrees (use with az)
             ra_hrs: Optional right ascension in hours (use with dec_deg)
@@ -269,13 +315,16 @@ class SafetyChecker:
             if source is not None:
                 # Source mode - calculate az/el from source
                 if ant is None:
-                    raise ValueError("Antenna identifier 'ant' is required when using source")
-                if pointing is None:
-                    raise ValueError("AstroPointing instance is required when using source")
-                
-                # Normalize antenna early (accepts either string or Antenna enum)
+                    raise ValueError(
+                        "Antenna identifier 'ant' is required when using source"
+                    )
+                # Normalize antenna early (accepts 'N'/'S'/Antenna enum)
                 _ = parse_antenna(ant)
-                
+                if pointing is None:
+                    raise ValueError(
+                        "AstroPointing instance is required when using source"
+                    )
+
                 target_az, target_el = pointing.radec2azel(
                     source,
                     ant,
@@ -286,14 +335,18 @@ class SafetyChecker:
                 )
 
                 # For sun safety check, use the source coordinates
-                sun_safety_result = self.check_position_safety(ra_hrs=source.ra_hrs, dec_deg=source.dec_deg, az=None, el=None, check_time=check_time)
+                sun_safety_result = self.check_position_safety(
+                    ra_hrs=source.ra_hrs, dec_deg=source.dec_deg, az=None, el=None, check_time=check_time
+                )
 
             elif az is not None and el is not None:
                 # Az/El mode - use provided coordinates directly
                 target_az, target_el = az, el
 
                 # For sun safety check, use the provided coordinates
-                sun_safety_result = self.check_position_safety(ra_hrs=None, dec_deg=None, az=target_az, el=target_el, check_time=check_time)
+                sun_safety_result = self.check_position_safety(
+                    ra_hrs=None, dec_deg=None, az=target_az, el=target_el, check_time=check_time
+                )
 
             else:
                 raise ValueError(
@@ -394,9 +447,9 @@ class SafetyChecker:
         This method returns a sequence of waypoints that safely moves the telescope
         from (current_az, current_el) to (target_az, target_el) while:
 
-        - Maintaining minimum safe distance from the Sun (≥ safety_radius_deg)
-        - Avoiding azimuth wrapping through 360 -> 0 boundary
-        - Staying within elevation limits [elevation_min, elevation_max]
+        • Maintaining minimum safe distance from the Sun (≥ safety_radius_deg)
+        • Avoiding azimuth wrapping through 360° → 0° boundary
+        • Staying within elevation limits [elevation_min, elevation_max]
 
         Strategy:
         1. First try a direct path - if safe and doesn't cross 360°/0° boundary, use it
@@ -429,17 +482,19 @@ class SafetyChecker:
         direct_path_result = self.check_path_safety(
             current_az, current_el, target_az, target_el
         )
-        if direct_path_result.is_safe:
+        az_distance = abs(shortest_azimuth_distance(current_az, target_az))
+
+        if direct_path_result.is_safe and az_distance <= 180:
             azs, els = [target_az], [target_el]
             return azs, els
 
         # Sun position and a few useful constants
         avoid = self.safety_radius_deg  # basic exclusion half-width
-        base_pad = config.sun.detour_base_padding  # start beyond the exclusion
-        safe_el_candidates = config.sun.safe_elevation_candidates
+        base_pad = config.telescope.detour_base_padding  # start beyond the exclusion
+        safe_el_candidates = config.telescope.safe_elevation_candidates
 
         logger.debug(
-            f"Direct path unsafe, searching for detour path"
+            f"Direct path unsafe or crosses 360°/0° boundary, searching for detour path"
         )
 
         for dir_sign in (+1, -1):
@@ -448,8 +503,8 @@ class SafetyChecker:
             # Search for a safe dog-leg path
             for pad in range(
                 int(base_pad),
-                int(config.sun.detour_max_padding + 1),
-                int(config.sun.detour_padding_step),
+                int(config.telescope.detour_max_padding + 1),
+                int(config.telescope.detour_padding_step),
             ):
                 detour_az = (sun_az + dir_sign * (avoid + pad)) % 360
 
@@ -460,7 +515,16 @@ class SafetyChecker:
                     azs = [current_az, current_az, detour_az, detour_az, target_az]
                     els = [current_el, safe_el, safe_el, target_el, target_el]
 
-                    # quick elevation band check
+                    # quick mechanical-limit check (no wrap, elevation band)
+                    mech_ok = True
+                    prev = current_az
+                    for az in azs[1:]:
+                        if abs(shortest_azimuth_distance(prev, az)) > 180:
+                            mech_ok = False
+                            break
+                        prev = az
+                    if not mech_ok:
+                        continue
                     if not all(
                         config.telescope.elevation_min
                         <= e

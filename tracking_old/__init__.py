@@ -28,6 +28,7 @@ from .utils.exceptions import (
 from .utils.config import config, TrackingConfig, TelescopeConfig, MQTTConfig
 from .utils.colors import Colors
 
+__version__ = "1.0.0"
 __all__ = [
     "Tracker", "Source", "State", "logger",
     "TrackingError", "SafetyError", "MQTTError", "PointingError",

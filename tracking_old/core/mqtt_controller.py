@@ -5,11 +5,9 @@ MQTT communication for telescope control
 import os
 import json
 import time
-import uuid
 import logging
 import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
-from typing import Optional
 from tracking.utils.config import config
 from tracking.utils.colors import Colors
 from tracking.utils.antenna import Antenna, antenna_letter, parse_antenna
@@ -18,7 +16,7 @@ from tracking.utils.antenna import Antenna, antenna_letter, parse_antenna
 logger = logging.getLogger(__name__)
 
 class MqttController:
-    def __init__(self, topic_az_status: Optional[str] = None, topic_az_cmd: Optional[str] = None, topic_el_status: Optional[str] = None, topic_el_cmd: Optional[str] = None, topic_prg_trk_cmd: Optional[str] = None, topic_act_time: Optional[str] = None, topic_start_time: Optional[str] = None):
+    def __init__(self):
         """
         Initialize the MqttController object with default parameters.
         
@@ -30,13 +28,13 @@ class MqttController:
         self.ant = None
         
         # Topics from config
-        self.topic_az_status = topic_az_status or config.mqtt.topic_az_status
-        self.topic_az_cmd = topic_az_cmd or config.mqtt.topic_az_cmd
-        self.topic_el_status = topic_el_status or config.mqtt.topic_el_status
-        self.topic_el_cmd = topic_el_cmd or config.mqtt.topic_el_cmd
-        self.topic_prg_trk_cmd = topic_prg_trk_cmd or config.mqtt.topic_prg_trk_cmd
-        self.topic_act_time = topic_act_time or config.mqtt.topic_act_time
-        self.topic_start_time = topic_start_time or config.mqtt.topic_start_time
+        self.topic_az_status = config.mqtt.topic_az_status
+        self.topic_az_cmd = config.mqtt.topic_az_cmd
+        self.topic_el_status = config.mqtt.topic_el_status
+        self.topic_el_cmd = config.mqtt.topic_el_cmd
+        self.topic_prg_trk_cmd = config.mqtt.topic_prg_trk_cmd
+        self.topic_act_time = config.mqtt.topic_act_time
+        self.topic_start_time = config.mqtt.topic_start_time
 
         # Messages
         self.messages = {}
@@ -80,9 +78,8 @@ class MqttController:
         """
         try:
             # Parse JSON message and store it
-            # Only the most recent message per subscribed topic is stored
             data = json.loads(msg.payload.decode())
-            self.messages[msg.topic] = data 
+            self.messages[msg.topic] = data
         except json.JSONDecodeError as e:
             logger.warning(f"{Colors.RED}Failed to parse MQTT message: {e}{Colors.RESET}")
         except Exception as e:
@@ -115,9 +112,10 @@ class MqttController:
         elif ant_enum == Antenna.SOUTH:
             broker_ip = config.mqtt.south_broker_ip
         else:
-            raise ValueError("Passed in an invalid antenna identifier. How did you do that!?")
+            raise ValueError("How did tis happen?")
 
-        # Create unique client ID to avoid conflicts (client_id is itself generated with uuid, but this avoids conflicts with other clients in the caipy package)
+        # Create unique client ID to avoid conflicts
+        import uuid
         unique_client_id = f"{config.mqtt.client_id}_{ant_code}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
         
         # Clean up any existing client
@@ -126,17 +124,17 @@ class MqttController:
                 self.mqtt_client.loop_stop()
                 self.mqtt_client.disconnect()
             except:
-                pass  # Ignore cleanup errors and hope for the best I guess...
+                pass  # Ignore cleanup errors
         
         self.mqtt_client = mqtt.Client(client_id=unique_client_id)
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
         
-        # Set keep alive interval for MQTT connection
-        self.mqtt_client.keepalive = 60 # seconds
+        # Set keep alive and other options for better reliability
+        self.mqtt_client._keepalive = 60
         
-        # Connect to broker (allowed 3 tries)
+        # Connect to broker with retry logic
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -155,9 +153,10 @@ class MqttController:
         start_time = time.time()
         while not self.mqtt_connected and (time.time() - start_time) < timeout:
             time.sleep(config.mqtt.poll_sleep_interval)
+        
         if not self.mqtt_connected:
             raise ConnectionError(f"Failed to connect to MQTT broker {broker_ip}:{port} within {timeout}s")
-
+        
         logger.info(f"{Colors.GREEN}Connected: {self.mqtt_connected}{Colors.RESET}")
         
         # Subscribe to topics
@@ -280,28 +279,24 @@ class MqttController:
         Sends track commands to both axes with zero velocity and acceleration arguments.
         Waits for the axes to enter 'track' mode, up to a configurable timeout.
         """
-        logger.info(f"{Colors.BLUE}Setting track mode{Colors.RESET}")
-
         # AZ
         sv = {
             'id_client': config.mqtt.id_client_motion,
             'source': config.mqtt.source,
             'destination': config.mqtt.destination_az,
             'name': 'track',
-            'args': [0, 0] # Zero velocity and acceleration
+            'args': [0, 0]
         }
         self.send_mqtt_command(self.topic_az_cmd, sv)
-        
         # EL
         sv = {
             'id_client': config.mqtt.id_client_motion,
             'source': config.mqtt.source,
             'destination': config.mqtt.destination_el,
             'name': 'track',
-            'args': [0, 0] # Zero velocity and acceleration
+            'args': [0, 0]
         }
         self.send_mqtt_command(self.topic_el_cmd, sv)
-        
         # Wait for mode
         self._wait_for_mode('track')
         self.print_status()
@@ -312,8 +307,6 @@ class MqttController:
         Sends stop commands to both axes to halt any ongoing motion.
         Waits for the axes to enter 'stop' mode, up to a configurable timeout.
         """
-        logger.info(f"{Colors.BLUE}Setting stop mode{Colors.RESET}")
-
         # AZ
         sv = {
             'id_client': config.mqtt.id_client_motion,
@@ -323,7 +316,6 @@ class MqttController:
             'args': []
         }
         self.send_mqtt_command(self.topic_az_cmd, sv)
-
         # EL
         sv = {
             'id_client': config.mqtt.id_client_motion,
@@ -333,7 +325,6 @@ class MqttController:
             'args': []
         }
         self.send_mqtt_command(self.topic_el_cmd, sv)
-
         # Wait for mode
         self._wait_for_mode('stop')
         self.print_status()
@@ -341,31 +332,28 @@ class MqttController:
     def set_axis_mode_position(self, az, el):
         """
         Set both azimuth and elevation axes to position mode.
-        Sends position commands to both axes with zero velocity and acceleration arguments. 
+        Sends position commands to both axes with zero velocity and acceleration arguments. False indicates that the position is NOT relative.
         Waits for the axes to enter 'position' mode, up to a configurable timeout.
         """
         logger.info(f"{Colors.BLUE}Setting position mode: AZ={az:.2f}°, EL={el:.2f}°{Colors.RESET}")
-        
         # AZ
         sv = {
             'id_client': config.mqtt.id_client_motion,
             'source': config.mqtt.source,
             'destination': config.mqtt.destination_az,
             'name': 'position',
-            'args': [False, az, 0, 0] # False indicates that the position is NOT relative. Zero velocity and acceleration.
+            'args': [False, az, 0, 0]
         }
         self.send_mqtt_command(self.topic_az_cmd, sv)
-        
         # EL
         sv = {
             'id_client': config.mqtt.id_client_motion,
             'source': config.mqtt.source,
             'destination': config.mqtt.destination_el,
             'name': 'position',
-            'args': [False, el, 0, 0] # False indicates that the position is NOT relative. Zero velocity and acceleration.
+            'args': [False, el, 0, 0]
         }
         self.send_mqtt_command(self.topic_el_cmd, sv)
-        
         # Wait for mode
         self._wait_for_mode('position')
         self.print_status()
@@ -382,7 +370,7 @@ class MqttController:
             az_mode, el_mode = self.get_current_mode()
             if az_mode == target_mode or el_mode == target_mode:
                 elapsed = time.time() - start_time
-                logger.info(f"{Colors.GREEN}First axes put in '{target_mode}' mode in {elapsed:.1f}s{Colors.RESET}")
+                logger.info(f"{Colors.GREEN}Axes put in '{target_mode}' mode in {elapsed:.1f}s{Colors.RESET}")
                 return True
             time.sleep(poll_interval)
         
@@ -391,10 +379,7 @@ class MqttController:
         return False
 
     def print_status(self):
-        """
-        Print state, position, target,and in_target for both Az and El axes.
-        """
-        # AZ status
+        # AZ status - show only key info with safe formatting
         az_status = self.read_mqtt_topic(self.topic_az_status)
         if az_status and 'v' in az_status:
             v = az_status['v']
@@ -404,7 +389,7 @@ class MqttController:
             tgt_str = f"{float(tgt_pos):.2f}" if isinstance(tgt_pos, (int, float)) else str(tgt_pos)
             logger.info(f"AZ: state={v.get('state', 'N/A')}, pos={act_str}°, target={tgt_str}°, in_target={v.get('in_target', 'N/A')}")
             
-        # EL status
+        # EL status - show only key info with safe formatting
         el_status = self.read_mqtt_topic(self.topic_el_status)
         if el_status and 'v' in el_status:
             v = el_status['v']
@@ -473,6 +458,7 @@ class MqttController:
     def setup_program_track(self):
         """
         Initialize the program track for trajectory following.
+        
         Clears any existing program track definition and sets the interpolation
         mode to '1' (linear interpolation between points).
         """

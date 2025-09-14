@@ -71,6 +71,7 @@ def d2m(dt: datetime) -> str:
     """
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
+
 def m2d(m: str) -> datetime:
     """
     Convert MTEX time format string to Python datetime.
@@ -116,6 +117,25 @@ def sync_to_half_second():
         if current_cs >= target_cs:
             break
         time.sleep(0.001)    
+
+def shortest_azimuth_distance(az1: float, az2: float) -> float:
+    """
+    Calculate the shortest azimuth distance between two azimuths.
+    Considers the no-wrap constraint of the telescope.
+    
+    Args:
+        az1: First azimuth (0-360)
+        az2: Second azimuth (0-360)
+        
+    Returns:
+        Shortest distance in degrees (positive or negative)
+    """
+    diff = az2 - az1
+    if diff > 180:
+        diff -= 360
+    elif diff < -180:
+        diff += 360
+    return diff
     
 def generate_telescope_path(current_az: float, current_el: float,
                             target_az: float, target_el: float,
@@ -142,39 +162,36 @@ def generate_telescope_path(current_az: float, current_el: float,
         Returns:
             az_path, el_path: Arrays of positions along the path
         """
-
-        def compute_axis_time(start: float, end: float, vel_max: float, acc_max: float) -> tuple:
-            """
-            Compute time needed for axis to complete motion.
-            """
-            distance = abs(end - start)  # in deg
-            t_acc = vel_max / acc_max  # time to reach max velocity
-            d_acc = 0.5 * acc_max * t_acc**2  # distance during acceleration
+        
+        def compute_axis_trajectory(start: float, end: float, vel_max: float, acc_max: float, num_points: int) -> np.ndarray:
+            """Compute trajectory for a single axis with trapezoidal velocity profile."""
+            distance = end - start
+            direction = np.sign(distance)
+            abs_distance = abs(distance)
+            
+            # Time to accelerate to max velocity
+            t_acc = vel_max / acc_max
+            
+            # Distance covered during acceleration
+            d_acc = 0.5 * acc_max * t_acc**2
             
             # Check if we reach max velocity
-            if 2 * d_acc > distance:
-                # Triangle profile (never reach max velocity)
-                t_acc = np.sqrt(distance / acc_max)
-                t_const = 0.0
-                t_total = 2.0 * t_acc
+            if 2 * d_acc > abs_distance:
+                # Triangle profile - we don't reach max velocity
+                # We accelerate halfway then decelerate
+                t_acc = np.sqrt(abs_distance / acc_max)
+                t_total = 2 * t_acc
+                t_const = 0
             else:
-                # Trapezoidal profile (reach max velocity)
-                d_const = distance - 2.0 * d_acc  # distance at constant velocity
+                # Trapezoidal profile - we reach max velocity
+                # Distance at constant velocity
+                d_const = abs_distance - 2 * d_acc
                 t_const = d_const / vel_max
-                t_total = 2.0 * t_acc + t_const
-
-            return t_total, t_acc, t_const
-        
-        def compute_axis_trajectory(times, t_acc, t_const, start: float, end: float, vel_max: float, acc_max: float) -> np.ndarray:
-            """
-            Compute trajectory for a single axis with trapezoidal velocity profile.
-            """
+                t_total = 2 * t_acc + t_const
+            
+            # Generate time points
+            times = np.linspace(0, t_total, num_points)
             positions = np.zeros_like(times)
-            distance = abs(end - start)
-            direction = 1.0 if end >= start else -1.0
-            # Distance covered during acceleration phase and velocity reached at end of acceleration
-            d_acc = 0.5 * acc_max * (t_acc ** 2)
-            v_reached = acc_max * t_acc  # equals vel_max for trapezoidal, < vel_max for triangular
             
             for i, t in enumerate(times):
                 if t <= t_acc:
@@ -183,28 +200,62 @@ def generate_telescope_path(current_az: float, current_el: float,
                 elif t <= t_acc + t_const:
                     # Constant velocity phase
                     t_at_const = t - t_acc
-                    positions[i] = start + direction * (d_acc + v_reached * t_at_const)
-                elif t <= t_acc*2 + t_const:
+                    positions[i] = start + direction * (d_acc + vel_max * t_at_const)
+                else:
                     # Deceleration phase
                     t_dec = t - t_acc - t_const
                     # Position at end of constant phase + deceleration distance
-                    d_at_const_end = d_acc + v_reached * t_const
-                    positions[i] = start + direction * (d_at_const_end + v_reached * t_dec - 0.5 * acc_max * t_dec**2)
-                else:
-                    # Reached position
-                    positions[i] = end
+                    d_at_const_end = d_acc + vel_max * t_const
+                    positions[i] = start + direction * (d_at_const_end + vel_max * t_dec - 0.5 * acc_max * t_dec**2)
             
             return positions
         
+        def compute_axis_time(start: float, end: float, vel_max: float, acc_max: float) -> float:
+            """Compute time needed for axis to complete motion."""
+            distance = abs(end - start)
+            t_acc = vel_max / acc_max
+            d_acc = 0.5 * acc_max * t_acc**2
+            
+            if 2 * d_acc > distance:
+                # Triangle profile
+                return 2 * np.sqrt(distance / acc_max)
+            else:
+                # Trapezoidal profile
+                d_const = distance - 2 * d_acc
+                return 2 * t_acc + d_const / vel_max
+        
         # Find which axis takes longer (this determines total slew time)
-        az_time, az_t_acc, az_t_const = compute_axis_time(current_az, target_az, az_vel_max, az_acc_max)
-        el_time, el_t_acc, el_t_const = compute_axis_time(current_el, target_el, el_vel_max, el_acc_max)
+        az_time = compute_axis_time(current_az, target_az, az_vel_max, az_acc_max)
+        el_time = compute_axis_time(current_el, target_el, el_vel_max, el_acc_max)
         total_time = max(az_time, el_time)
-
-        # Generate paths
-        times = np.linspace(0.0, total_time, num_steps)
-
-        az_path = compute_axis_trajectory(times, az_t_acc, az_t_const, current_az, target_az, az_vel_max, az_acc_max)
-        el_path = compute_axis_trajectory(times, el_t_acc, el_t_const, current_el, target_el, el_vel_max, el_acc_max)
-
+        
+        # Generate synchronized paths
+        # Both axes start and stop together, but each follows its own profile
+        az_path = compute_axis_trajectory(current_az, target_az, az_vel_max, az_acc_max, num_steps)
+        el_path = compute_axis_trajectory(current_el, target_el, el_vel_max, el_acc_max, num_steps)
+        
+        # If one axis finishes before the other, we need to resample its trajectory
+        # to match the slower axis timing
+        if abs(az_time - el_time) > 1e-6:  # Not equal
+            if az_time < el_time:
+                # Azimuth finishes first, need to stretch its trajectory
+                # Create time array for original azimuth trajectory
+                az_times_orig = np.linspace(0, az_time, num_steps)
+                # Create time array for synchronized trajectory
+                times_sync = np.linspace(0, total_time, num_steps)
+                # Interpolate azimuth positions to synchronized times
+                # After az_time, azimuth stays at target position
+                az_interp = np.interp(times_sync, 
+                                    np.append(az_times_orig, total_time),
+                                    np.append(az_path, target_az))
+                az_path = az_interp
+            else:
+                # Elevation finishes first
+                el_times_orig = np.linspace(0, el_time, num_steps)
+                times_sync = np.linspace(0, total_time, num_steps)
+                el_interp = np.interp(times_sync,
+                                    np.append(el_times_orig, total_time),
+                                    np.append(el_path, target_el))
+                el_path = el_interp
+        
         return az_path, el_path
