@@ -39,7 +39,7 @@ class CLIProgressCallback(ProgressCallback):
                     self.last_percent = progress_info.percent_complete
 
 def track_and_park(ant: str, ra_hrs: float = None, dec_deg: float = None, pm_ra: float = 0, pm_dec: float = 0, 
-                  plx: float = 0.0001, radvel: float = 0, duration_hours: int = 0.5, slew: bool = True, park: bool = True,
+                  plx: float = 0.0001, radvel: float = 0, duration_hours: float = 0.5, slew: bool = True, park: bool = True,
                   source: Source = None, progress_callback: ProgressCallback = None):
     """
     Track a source at the given RA/Dec coordinates and optionally park the telescope.
@@ -220,7 +220,7 @@ def park_telescope(ant: str, progress_callback: ProgressCallback = None):
             traceback.print_exc()
         return False
 
-def track_multiple_positions(ant: str, positions: list, pm_ra: float = 0, pm_dec: float = 0, plx: float = 0.0001, radvel: float = 0, duration_hours: int = 0.01, slew: bool = True, park: bool = True, progress_callback: ProgressCallback = None):
+def track_multiple_positions(ant: str, positions: list, pm_ra: float = 0, pm_dec: float = 0, plx: float = 0.0001, radvel: float = 0, duration_hours: float = 0.01, slew: bool = True, park: bool = True, progress_callback: ProgressCallback = None):
     """
     Track multiple sources sequentially for a fixed duration each.
 
@@ -314,7 +314,7 @@ def main():
     track_parser.add_argument("-pm_dec", type=float, default=0, help="Proper motion in Dec (mas/yr)")
     track_parser.add_argument("-plx", type=float, default=0.0001, help="Parallax (mas)")
     track_parser.add_argument("-radvel", type=float, default=0, help="Radial velocity (km/s)")
-    track_parser.add_argument("-n", "--duration_hours", type=int, default=0.5, help="Number of hours to track (default 0.5)")
+    track_parser.add_argument("-n", "--duration_hours", type=float, default=0.5, help="Number of hours to track (default 0.5)")
     track_parser.add_argument("--no-slew", action="store_true", help="Don't slew to source")
     track_parser.add_argument("--no-park", action="store_true", help="Don't park the telescope after tracking")
     
@@ -351,7 +351,7 @@ def main():
     tm_parser.add_argument("-pm_dec", type=float, default=0, help="Proper motion in Dec (mas/yr)")
     tm_parser.add_argument("-plx", type=float, default=0.0001, help="Parallax (mas)")
     tm_parser.add_argument("-radvel", type=float, default=0, help="Radial velocity (km/s)")
-    tm_parser.add_argument("-n", "--duration_hours", type=int, default=0.01, help="Number of hours to track per source (default 0.01)")
+    tm_parser.add_argument("-n", "--duration_hours", type=float, default=0.01, help="Number of hours to track per source (default 0.01)")
     tm_parser.add_argument("--no-slew", action="store_true", help="Don't slew to the first source")
     tm_parser.add_argument("--no-park", action="store_true", help="Don't park the telescope after tracking")
 

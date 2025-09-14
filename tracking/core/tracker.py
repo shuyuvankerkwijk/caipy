@@ -556,7 +556,7 @@ class Tracker:
             if not safety_result.is_safe:
                 raise SafetyError(f"Sun safety check failed: {safety_result.message}")
 
-    def _validate_target_coordinates(self, az: float, el: float, ant: str) -> None:
+    def _validate_target_coordinates(self, az: float, el: float, ant: Antenna) -> None:
         """Validate target coordinates."""
         logger.info(f"Performing target validation...")
         validation_result = self.safety_checker.validate_target(az=az, el=el)
